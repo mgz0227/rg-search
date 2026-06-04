@@ -1,4 +1,4 @@
-# requirements.txt for rg_search_ultra.py
+# requirements.txt for rgs.py
 #
 # Python package dependencies:
 # This project uses only Python standard-library modules.

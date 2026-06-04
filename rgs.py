@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-rg_search_ultra.py
+rgs.py
 
 A high-speed folder content search tool powered by ripgrep.
 
@@ -16,10 +16,10 @@ Highlights:
 - Progress logging, limits, file glob include/exclude filters, and summary report.
 
 Examples:
-  python3 rg_search_ultra.py -p /data -k password token secret -o result.jsonl --format jsonl
-  python3 rg_search_ultra.py -p /data -k OpenWrt --glob '*.c' --glob '*.h' --dedupe content
-  python3 rg_search_ultra.py -p /data --keyword-file keywords.txt -o result.csv --format csv --dedupe-store sqlite
-  python3 rg_search_ultra.py -p /data -k api_key --all --exclude '.git/**' --exclude 'node_modules/**'
+  python3 rgs.py -p /data -k password token secret -o result.jsonl --format jsonl
+  python3 rgs.py -p /data -k OpenWrt --glob '*.c' --glob '*.h' --dedupe content
+  python3 rgs.py -p /data --keyword-file keywords.txt -o result.csv --format csv --dedupe-store sqlite
+  python3 rgs.py -p /data -k api_key --all --exclude '.git/**' --exclude 'node_modules/**'
 """
 
 from __future__ import annotations
