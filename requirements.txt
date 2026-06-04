@@ -1,0 +1,16 @@
+# requirements.txt for rg_search_ultra.py
+#
+# Python package dependencies:
+# This project uses only Python standard-library modules.
+# No pip packages are required.
+#
+# Recommended Python version: >=3.8
+#
+# External system dependency, install separately:
+#   ripgrep (the `rg` command)
+#
+# Install ripgrep examples:
+#   Ubuntu/Debian: sudo apt install ripgrep
+#   macOS:         brew install ripgrep
+#   Windows Scoop: scoop install ripgrep
+#   Windows Choco: choco install ripgrep

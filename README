@@ -1,0 +1,911 @@
+# 使用文档
+
+`rg_search` 是一个基于 `ripgrep` 的高速文件夹内容检索工具，适合在大量文件、代码仓库、日志目录、配置目录中快速查找关键词，并将结果导出为 TXT、CSV、JSONL 或 Markdown 格式。
+
+它支持多关键词检索、关键词文件、目录排除、文件类型过滤、结果去重、超大结果集 SQLite 去重、进度输出和自动生成汇总报告。
+
+---
+
+## 1. 功能特点
+
+* 极速递归搜索文件夹内容
+* 支持多个关键词
+* 支持从关键词文件批量读取关键词
+* 默认使用固定字符串搜索，速度快且更安全
+* 可切换为正则搜索
+* 支持 TXT、CSV、JSONL、Markdown 输出
+* 支持按内容、文件+内容、文件+行号+内容去重
+* 支持内存去重和 SQLite 去重
+* 支持隐藏文件、忽略 `.gitignore`、二进制按文本扫描
+* 支持 include / exclude glob 过滤
+* 自动生成 summary 统计报告
+* 可限制最大输出结果数
+* 可显示实时进度
+
+---
+
+## 2. 环境要求
+
+需要提前安装：
+
+* Python 3
+* ripgrep，也就是 `rg` 命令
+
+确认是否已安装 ripgrep：
+
+```bash
+rg --version
+```
+
+如果提示找不到 `rg`，需要先安装 ripgrep。
+
+Ubuntu / Debian：
+
+```bash
+sudo apt update
+sudo apt install ripgrep
+```
+
+macOS：
+
+```bash
+brew install ripgrep
+```
+
+Windows 可以使用 Scoop：
+
+```powershell
+scoop install ripgrep
+```
+
+或使用 Chocolatey：
+
+```powershell
+choco install ripgrep
+```
+
+---
+
+## 3. 基本用法
+
+最简单的用法：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password token secret
+```
+
+含义：
+
+* `-p /data`：搜索 `/data` 目录
+* `-k password token secret`：搜索三个关键词
+* 默认输出到 `rg_results.jsonl`
+* 默认输出格式为 `jsonl`
+* 默认按内容去重
+
+指定输出文件：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password token secret -o result.jsonl
+```
+
+指定输出格式：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password token secret -o result.csv --format csv
+```
+
+---
+
+## 4. 常用命令示例
+
+### 4.1 搜索单个关键词
+
+```bash
+python3 rg_search_ultra.py -p /data -k password -o result.jsonl
+```
+
+### 4.2 搜索多个关键词
+
+```bash
+python3 rg_search_ultra.py -p /data -k password token secret api_key -o result.jsonl
+```
+
+### 4.3 搜索多个目录
+
+```bash
+python3 rg_search_ultra.py -p /data /logs /backup -k password secret -o result.jsonl
+```
+
+### 4.4 输出为 CSV
+
+```bash
+python3 rg_search_ultra.py -p /data -k password token -o result.csv --format csv
+```
+
+### 4.5 输出为 Markdown 表格
+
+```bash
+python3 rg_search_ultra.py -p /data -k password token -o result.md --format md
+```
+
+### 4.6 输出为普通文本
+
+```bash
+python3 rg_search_ultra.py -p /data -k password token -o result.txt --format txt
+```
+
+---
+
+## 5. 使用关键词文件
+
+当关键词很多时，可以把关键词放进一个文本文件。
+
+`keywords.txt` 示例：
+
+```text
+password
+token
+secret
+api_key
+access_key
+```
+
+运行：
+
+```bash
+python3 rg_search_ultra.py -p /data --keyword-file keywords.txt -o result.jsonl
+```
+
+也可以同时使用 `-k` 和 `--keyword-file`：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --keyword-file keywords.txt -o result.jsonl
+```
+
+脚本会自动合并关键词，并保留唯一关键词。
+
+默认情况下，关键词文件里的空行和以 `#` 开头的注释行会被忽略。
+
+---
+
+## 6. 输出格式说明
+
+### 6.1 JSONL 格式
+
+命令：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password -o result.jsonl --format jsonl
+```
+
+每一行都是一个 JSON 对象，适合后续用程序处理。
+
+示例：
+
+```json
+{"file":"/data/config.txt","line":12,"column":8,"content":"db_password=123456","matches":["password"],"submatches":[{"start":3,"end":11,"text":"password"}],"absolute_offset":1234}
+```
+
+字段说明：
+
+| 字段                | 说明              |
+| ----------------- | --------------- |
+| `file`            | 命中的文件路径         |
+| `line`            | 命中的行号           |
+| `column`          | 命中的列号           |
+| `content`         | 命中的整行内容         |
+| `matches`         | 当前行命中的关键词       |
+| `submatches`      | 命中关键词的位置详情      |
+| `absolute_offset` | 在文件中的字节偏移量，可能为空 |
+
+---
+
+### 6.2 CSV 格式
+
+命令：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password -o result.csv --format csv
+```
+
+CSV 字段：
+
+```text
+file,line,column,matches,content
+```
+
+适合用 Excel、WPS、LibreOffice 或数据分析工具打开。
+
+---
+
+### 6.3 TXT 格式
+
+命令：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password -o result.txt --format txt
+```
+
+输出格式：
+
+```text
+文件路径:行号:列号: 命中内容
+```
+
+示例：
+
+```text
+/data/config.txt:12:8: db_password=123456
+```
+
+---
+
+### 6.4 Markdown 格式
+
+命令：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password -o result.md --format md
+```
+
+输出为 Markdown 表格，适合直接贴到报告或文档中。
+
+---
+
+## 7. 结果去重
+
+脚本默认启用去重：
+
+```bash
+--dedupe content
+```
+
+也就是：只要命中的内容行相同，就只保留第一条。
+
+### 7.1 不去重
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --dedupe none
+```
+
+### 7.2 按内容去重
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --dedupe content
+```
+
+适合清理重复日志、重复配置、重复文本。
+
+### 7.3 按文件+内容去重
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --dedupe file-content
+```
+
+含义：同一个文件里重复的相同内容只保留一次，但不同文件中相同内容会分别保留。
+
+### 7.4 按文件+行号+内容去重
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --dedupe line
+```
+
+含义：只有文件、行号、内容都相同才算重复。
+
+这种模式最接近原始搜索结果，但可以去掉重复扫描产生的重复行。
+
+---
+
+## 8. 大结果集去重
+
+默认去重方式使用内存：
+
+```bash
+--dedupe-store memory
+```
+
+如果结果非常大，例如百万级或千万级命中，建议使用 SQLite 去重：
+
+```bash
+python3 rg_search_ultra.py \
+  -p /data \
+  --keyword-file keywords.txt \
+  -o result.jsonl \
+  --format jsonl \
+  --dedupe content \
+  --dedupe-store sqlite
+```
+
+SQLite 模式会减少内存压力，更适合超大目录或长时间扫描。
+
+默认情况下，自动生成的 SQLite 去重数据库会在任务结束后删除。
+
+如果想保留去重数据库：
+
+```bash
+--keep-dedupe-db
+```
+
+指定去重数据库路径：
+
+```bash
+--dedupe-db dedupe.sqlite
+```
+
+---
+
+## 9. 去重细节控制
+
+### 9.1 忽略首尾空白
+
+默认开启：
+
+```bash
+--dedupe-trim
+```
+
+关闭：
+
+```bash
+--no-dedupe-trim
+```
+
+### 9.2 合并连续空白
+
+```bash
+--dedupe-collapse-space
+```
+
+例如下面两行会被视为相同：
+
+```text
+password = 123456
+password    =    123456
+```
+
+### 9.3 去重时忽略大小写
+
+```bash
+--dedupe-ignore-case
+```
+
+例如下面两行会被视为相同：
+
+```text
+Password=123456
+password=123456
+```
+
+---
+
+## 10. 文件过滤
+
+### 10.1 只搜索指定类型文件
+
+搜索 Python 文件：
+
+```bash
+python3 rg_search_ultra.py -p /project -k password --glob "*.py"
+```
+
+搜索 C / H 文件：
+
+```bash
+python3 rg_search_ultra.py -p /project -k OpenWrt --glob "*.c" --glob "*.h"
+```
+
+搜索配置文件：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --glob "*.conf" --glob "*.ini" --glob "*.yaml" --glob "*.yml"
+```
+
+### 10.2 排除目录
+
+排除 `.git` 和 `node_modules`：
+
+```bash
+python3 rg_search_ultra.py \
+  -p /project \
+  -k password token \
+  --exclude .git \
+  --exclude node_modules
+```
+
+脚本会自动扩展排除规则，例如：
+
+```text
+.git
+.git/**
+**/.git
+**/.git/**
+```
+
+因此可以更稳地排除不同层级下的目录。
+
+### 10.3 同时包含和排除
+
+只搜索 Python 文件，但排除虚拟环境：
+
+```bash
+python3 rg_search_ultra.py \
+  -p /project \
+  -k password \
+  --glob "*.py" \
+  --exclude .venv \
+  --exclude venv \
+  --exclude __pycache__
+```
+
+---
+
+## 11. 搜索隐藏文件、忽略规则和二进制文件
+
+默认情况下，ripgrep 会遵守部分忽略规则。
+
+如果想尽可能完整地扫描所有内容，可以使用：
+
+```bash
+--all
+```
+
+示例：
+
+```bash
+python3 rg_search_ultra.py -p /data -k secret --all
+```
+
+`--all` 相当于开启：
+
+* `--hidden`：搜索隐藏文件和隐藏目录
+* `--no-ignore`：不遵守 `.gitignore`、`.ignore` 等忽略规则
+* `--text`：把二进制文件当文本搜索
+
+也可以单独使用：
+
+```bash
+--hidden
+--no-ignore
+--text
+```
+
+---
+
+## 12. 正则搜索
+
+默认是固定字符串搜索：
+
+```bash
+--fixed-strings
+```
+
+这更快，也更安全。
+
+如果需要正则表达式，使用：
+
+```bash
+--regex
+```
+
+示例：搜索手机号格式：
+
+```bash
+python3 rg_search_ultra.py -p /data -k "1[3-9][0-9]{9}" --regex -o phones.jsonl
+```
+
+多行正则：
+
+```bash
+python3 rg_search_ultra.py -p /data -k "BEGIN[\s\S]*?END" --regex --multiline
+```
+
+注意：多行正则会更慢，建议只在必要时使用。
+
+---
+
+## 13. 大文件和性能控制
+
+### 13.1 设置线程数
+
+默认：
+
+```bash
+--threads 0
+```
+
+表示由 ripgrep 自动决定线程数。
+
+指定 8 个线程：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --threads 8
+```
+
+### 13.2 跳过超大文件
+
+跳过超过 100M 的文件：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --max-filesize 100M
+```
+
+跳过超过 1G 的文件：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --max-filesize 1G
+```
+
+### 13.3 限制每个文件的命中数
+
+每个文件最多保留 20 条：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --max-count-per-file 20
+```
+
+### 13.4 限制总输出结果数
+
+只输出前 1000 条唯一结果：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --limit 1000
+```
+
+---
+
+## 14. 进度显示
+
+默认每 10000 条原始命中显示一次进度：
+
+```bash
+--progress-every 10000
+```
+
+改为每 1000 条显示一次：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --progress-every 1000
+```
+
+安静模式，不显示进度：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --quiet
+```
+
+调试模式，显示实际执行的 ripgrep 命令，并输出 stderr：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --debug
+```
+
+---
+
+## 15. 汇总报告
+
+默认会生成汇总文件：
+
+```text
+输出文件.summary.json
+```
+
+例如：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password -o result.jsonl
+```
+
+会生成：
+
+```text
+result.jsonl
+result.jsonl.summary.json
+```
+
+汇总报告包含：
+
+* 脚本版本
+* 生成时间
+* 搜索路径
+* 输出文件
+* 输出格式
+* 关键词数量
+* 搜索模式
+* 去重模式
+* 原始命中数量
+* 写入结果数量
+* 去重删除数量
+* 命中文件数量
+* Top 命中文件
+* 总耗时
+* 每秒命中速度
+* ripgrep 返回码
+* 实际执行命令
+
+关闭汇总报告：
+
+```bash
+--no-summary
+```
+
+指定汇总报告路径：
+
+```bash
+--summary report.json
+```
+
+---
+
+## 16. 推荐使用场景
+
+### 16.1 安全敏感信息扫描
+
+```bash
+python3 rg_search_ultra.py \
+  -p /data \
+  -k password passwd pwd token secret api_key access_key private_key \
+  -o security_hits.jsonl \
+  --format jsonl \
+  --dedupe content \
+  --dedupe-store sqlite \
+  --exclude .git \
+  --exclude node_modules
+```
+
+### 16.2 代码仓库关键词检索
+
+```bash
+python3 rg_search_ultra.py \
+  -p /project \
+  -k OpenWrt \
+  --glob "*.c" \
+  --glob "*.h" \
+  --glob "*.py" \
+  -o code_hits.csv \
+  --format csv
+```
+
+### 16.3 日志目录快速检索
+
+```bash
+python3 rg_search_ultra.py \
+  -p /var/log \
+  -k ERROR WARNING CRITICAL \
+  -o log_hits.jsonl \
+  --format jsonl \
+  --dedupe file-content
+```
+
+### 16.4 超大目录扫描
+
+```bash
+python3 rg_search_ultra.py \
+  -p /data \
+  --keyword-file keywords.txt \
+  -o result.jsonl \
+  --format jsonl \
+  --dedupe content \
+  --dedupe-store sqlite \
+  --progress-every 50000 \
+  --max-filesize 500M
+```
+
+### 16.5 生成 Markdown 报告
+
+```bash
+python3 rg_search_ultra.py \
+  -p /data \
+  -k password token secret \
+  -o report.md \
+  --format md \
+  --dedupe content
+```
+
+---
+
+## 17. 参数总览
+
+| 参数                        | 说明                                          |
+| ------------------------- | ------------------------------------------- |
+| `-p`, `--path`            | 要搜索的文件或目录，可传多个                              |
+| `-k`, `--keywords`        | 要搜索的关键词，可传多个                                |
+| `--keyword-file`          | 从文件读取关键词，一行一个                               |
+| `-o`, `--output`          | 输出文件路径                                      |
+| `--format`                | 输出格式：`txt`、`csv`、`jsonl`、`md`               |
+| `--summary`               | 指定汇总 JSON 路径                                |
+| `--no-summary`            | 不生成汇总报告                                     |
+| `--regex`                 | 使用正则模式                                      |
+| `--multiline`             | 正则模式下启用多行匹配                                 |
+| `--ignore-case`           | 忽略大小写                                       |
+| `--case-sensitive`        | 严格区分大小写                                     |
+| `--smart-case`            | 智能大小写，默认行为                                  |
+| `--glob`                  | 包含指定 glob，可重复                               |
+| `--exclude`               | 排除指定 glob 或目录，可重复                           |
+| `--all`                   | 搜索隐藏文件、忽略 ignore 规则、二进制按文本处理                |
+| `--hidden`                | 搜索隐藏文件                                      |
+| `--no-ignore`             | 不遵守 ignore 规则                               |
+| `--text`                  | 二进制按文本搜索                                    |
+| `--follow`                | 跟随符号链接                                      |
+| `--mmap`                  | 使用内存映射，默认开启                                 |
+| `--no-mmap`               | 关闭内存映射                                      |
+| `--threads`               | ripgrep 线程数，`0` 表示自动                        |
+| `--max-filesize`          | 跳过超过指定大小的文件                                 |
+| `--max-columns`           | 跳过超长行                                       |
+| `--max-count-per-file`    | 每个文件最多命中数量                                  |
+| `--limit`                 | 总输出结果数上限                                    |
+| `--dedupe`                | 去重模式：`none`、`line`、`content`、`file-content` |
+| `--dedupe-store`          | 去重存储：`memory`、`sqlite`                      |
+| `--dedupe-db`             | 指定 SQLite 去重数据库路径                           |
+| `--keep-dedupe-db`        | 保留自动生成的 SQLite 去重数据库                        |
+| `--dedupe-trim`           | 去重前去掉首尾空白，默认开启                              |
+| `--no-dedupe-trim`        | 去重前不去掉首尾空白                                  |
+| `--dedupe-collapse-space` | 去重前合并连续空白                                   |
+| `--dedupe-ignore-case`    | 去重时忽略大小写                                    |
+| `--progress-every`        | 每多少条原始命中显示一次进度                              |
+| `--quiet`                 | 静默模式                                        |
+| `--debug`                 | 调试模式                                        |
+| `--rg-bin`                | 指定 ripgrep 可执行文件路径                          |
+
+---
+
+## 18. 常见问题
+
+### 18.1 提示 ripgrep executable not found
+
+说明系统找不到 `rg` 命令。
+
+解决方法：
+
+1. 安装 ripgrep
+2. 或使用 `--rg-bin` 指定路径
+
+示例：
+
+```bash
+python3 rg_search_ultra.py -p /data -k password --rg-bin /usr/local/bin/rg
+```
+
+---
+
+### 18.2 为什么没有搜索到隐藏文件？
+
+默认不一定搜索隐藏文件。
+
+使用：
+
+```bash
+--hidden
+```
+
+或直接使用完整扫描模式：
+
+```bash
+--all
+```
+
+---
+
+### 18.3 为什么 `.gitignore` 里的文件没有被搜索？
+
+ripgrep 默认可能会遵守 ignore 规则。
+
+使用：
+
+```bash
+--no-ignore
+```
+
+或：
+
+```bash
+--all
+```
+
+---
+
+### 18.4 为什么结果比预期少？
+
+可能原因：
+
+1. 默认开启了内容去重
+2. 使用了 `--glob` 限制文件类型
+3. 使用了 `--exclude` 排除了目录
+4. 使用了 `--max-count-per-file`
+5. 使用了 `--limit`
+
+如果想查看完整原始结果，可以使用：
+
+```bash
+--dedupe none
+```
+
+---
+
+### 18.5 搜索关键词里有特殊字符怎么办？
+
+默认是固定字符串搜索，特殊字符会被当成普通字符处理。
+
+例如搜索：
+
+```text
+a.b*c?
+```
+
+直接执行即可：
+
+```bash
+python3 rg_search_ultra.py -p /data -k "a.b*c?"
+```
+
+只有使用 `--regex` 时，特殊字符才会按正则表达式解释。
+
+---
+
+### 18.6 结果太大怎么办？
+
+建议：
+
+1. 使用 `--dedupe content`
+2. 使用 `--dedupe-store sqlite`
+3. 使用 `--max-filesize` 跳过超大文件
+4. 使用 `--glob` 限制文件类型
+5. 使用 `--exclude` 排除无关目录
+6. 使用 `--limit` 限制输出数量
+
+示例：
+
+```bash
+python3 rg_search_ultra.py \
+  -p /data \
+  --keyword-file keywords.txt \
+  -o result.jsonl \
+  --dedupe content \
+  --dedupe-store sqlite \
+  --max-filesize 500M \
+  --exclude node_modules \
+  --exclude .git
+```
+
+---
+
+## 19. 推荐默认命令
+
+如果只是想快速、稳定、去重地查目录内容，推荐：
+
+```bash
+python3 rg_search_ultra.py \
+  -p /data \
+  -k password token secret api_key \
+  -o result.jsonl \
+  --format jsonl \
+  --dedupe content \
+  --exclude .git \
+  --exclude node_modules
+```
+
+如果是超大目录，推荐：
+
+```bash
+python3 rg_search_ultra.py \
+  -p /data \
+  --keyword-file keywords.txt \
+  -o result.jsonl \
+  --format jsonl \
+  --dedupe content \
+  --dedupe-store sqlite \
+  --progress-every 50000 \
+  --exclude .git \
+  --exclude node_modules
+```
+
+---
+
+## 20. 退出码说明
+
+脚本会把 ripgrep 的常见返回码做兼容处理：
+
+* `0`：找到匹配结果
+* `1`：没有找到匹配结果，也视为正常完成
+* 其他返回码：通常表示执行异常
+
+如果使用 `--debug`，可以看到更详细的 ripgrep 错误信息。
