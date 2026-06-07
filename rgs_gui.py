@@ -39,7 +39,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "rg-search GUI - A/B/C Field Search"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 FIELD_LABEL_TO_VALUE = {
     "任意字段 A/B/C": "ANY",
@@ -48,6 +48,11 @@ FIELD_LABEL_TO_VALUE = {
     "C 字段": "C",
 }
 FIELD_VALUE_TO_LABEL = {value: label for label, value in FIELD_LABEL_TO_VALUE.items()}
+EXPORT_LABEL_TO_VALUE = {
+    "CSV 表格 (.csv)": "csv",
+    "TXT 一行一个 A:B:C (.txt)": "txt",
+}
+EXPORT_VALUE_TO_LABEL = {value: label for label, value in EXPORT_LABEL_TO_VALUE.items()}
 
 
 @dataclass(frozen=True)
@@ -403,22 +408,49 @@ def run_search(
                     candidate.unlink()
 
 
+EXPORT_COLUMNS = ["A", "B", "C", "file", "line", "source_line"]
+
+
+def row_to_export_dict(row: TripleRow) -> dict:
+    return {
+        "A": row.a,
+        "B": row.b,
+        "C": row.c,
+        "file": row.file,
+        "line": row.line,
+        "source_line": row.source_line,
+    }
+
+
 def export_rows_to_csv(path: Path, rows: Sequence[TripleRow]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8-sig", newline="") as fp:
-        writer = csv.DictWriter(fp, fieldnames=["A", "B", "C", "file", "line", "source_line"])
+        writer = csv.DictWriter(fp, fieldnames=EXPORT_COLUMNS)
         writer.writeheader()
         for row in rows:
-            writer.writerow(
-                {
-                    "A": row.a,
-                    "B": row.b,
-                    "C": row.c,
-                    "file": row.file,
-                    "line": row.line,
-                    "source_line": row.source_line,
-                }
-            )
+            writer.writerow(row_to_export_dict(row))
+
+
+def sanitize_txt_part(value: object) -> str:
+    """Keep one exported A:B:C record on a single physical line."""
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def export_rows_to_txt(path: Path, rows: Sequence[TripleRow]) -> None:
+    """Export TXT as one de-duplicated A:B:C record per line, without a header."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fp:
+        for row in rows:
+            fp.write(f"{sanitize_txt_part(row.a)}:{sanitize_txt_part(row.b)}:{sanitize_txt_part(row.c)}\n")
+
+
+def export_rows(path: Path, rows: Sequence[TripleRow], export_format: str) -> None:
+    if export_format == "csv":
+        export_rows_to_csv(path, rows)
+    elif export_format == "txt":
+        export_rows_to_txt(path, rows)
+    else:
+        raise ValueError(f"不支持的导出格式: {export_format}")
 
 
 class RgSearchGui(tk.Tk):
@@ -449,6 +481,7 @@ class RgSearchGui(tk.Tk):
         self.max_columns_var = tk.StringVar(value="")
         self.max_count_var = tk.StringVar(value="")
         self.output_limit_var = tk.StringVar(value="0")
+        self.export_format_var = tk.StringVar(value=EXPORT_VALUE_TO_LABEL["csv"])
         self.status_var = tk.StringVar(value="就绪")
 
     def _build_layout(self) -> None:
@@ -525,7 +558,16 @@ class RgSearchGui(tk.Tk):
         self.start_button.pack(side=tk.LEFT)
         self.cancel_button = ttk.Button(button_frame, text="取消", command=self._cancel_search, state=tk.DISABLED)
         self.cancel_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.export_button = ttk.Button(button_frame, text="导出 CSV 表格", command=self._export_csv, state=tk.DISABLED)
+        ttk.Label(button_frame, text="导出格式").pack(side=tk.LEFT, padx=(14, 4))
+        export_combo = ttk.Combobox(
+            button_frame,
+            textvariable=self.export_format_var,
+            values=list(EXPORT_LABEL_TO_VALUE.keys()),
+            state="readonly",
+            width=24,
+        )
+        export_combo.pack(side=tk.LEFT)
+        self.export_button = ttk.Button(button_frame, text="导出结果", command=self._export_results, state=tk.DISABLED)
         self.export_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(button_frame, text="清空结果", command=self._clear_results).pack(side=tk.LEFT, padx=(8, 0))
 
@@ -652,23 +694,34 @@ class RgSearchGui(tk.Tk):
             self.log_text.delete("1.0", tk.END)
             self.log_text.configure(state=tk.DISABLED)
 
-    def _export_csv(self) -> None:
+    def _export_results(self) -> None:
         if not self.rows:
             messagebox.showinfo("无结果", "当前没有可导出的结果。")
             return
+
+        export_format = EXPORT_LABEL_TO_VALUE.get(self.export_format_var.get(), "csv")
+        if export_format == "txt":
+            title = "导出 TXT：一行一个 A:B:C"
+            extension = ".txt"
+            filetypes = [("TXT", "*.txt"), ("CSV", "*.csv"), ("All files", "*")]
+        else:
+            title = "导出 CSV 表格"
+            extension = ".csv"
+            filetypes = [("CSV", "*.csv"), ("TXT", "*.txt"), ("All files", "*")]
+
         path = filedialog.asksaveasfilename(
-            title="导出 CSV 表格",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("All files", "*")],
+            title=title,
+            defaultextension=extension,
+            filetypes=filetypes,
         )
         if not path:
             return
         try:
-            export_rows_to_csv(Path(path), self.rows)
+            export_rows(Path(path), self.rows, export_format)
         except Exception as exc:
             messagebox.showerror("导出失败", str(exc))
             return
-        messagebox.showinfo("导出完成", f"已导出 {len(self.rows):,} 条结果。")
+        messagebox.showinfo("导出完成", f"已按 {export_format.upper()} 格式导出 {len(self.rows):,} 条结果。")
 
     def _insert_rows(self, rows: Sequence[TripleRow]) -> None:
         self.rows = list(rows)
@@ -736,6 +789,26 @@ def run_self_test() -> int:
     if not matcher.matches(TripleRow("https://a.test/", "Alice", "x")):
         print("FAILED FieldMatcher B ignore-case", file=sys.stderr)
         return 1
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = Path(tmpdir) / "out.csv"
+        txt_path = Path(tmpdir) / "out.txt"
+        export_rows(csv_path, deduped, "csv")
+        export_rows(txt_path, deduped, "txt")
+        csv_lines = csv_path.read_text(encoding="utf-8-sig").splitlines()
+        txt_lines = txt_path.read_text(encoding="utf-8").splitlines()
+        if not csv_lines or csv_lines[0] != "A,B,C,file,line,source_line":
+            print("FAILED CSV export header", file=sys.stderr)
+            return 1
+        if len(txt_lines) != len(deduped):
+            print("FAILED TXT export line count", file=sys.stderr)
+            return 1
+        if any(line.startswith("A:B:C") for line in txt_lines):
+            print("FAILED TXT export should not include a header", file=sys.stderr)
+            return 1
+        if not all(line.count(":") >= 2 for line in txt_lines):
+            print("FAILED TXT export A:B:C format", file=sys.stderr)
+            return 1
 
     print("self-test ok")
     return 0
