@@ -26,14 +26,12 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-import hashlib
 import json
 import os
 import queue
 import re
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -54,7 +52,7 @@ except Exception:  # pragma: no cover - headless/minimal Python installs
     messagebox = None  # type: ignore[assignment]
     ttk = None  # type: ignore[assignment]
 
-VERSION = "3.0.0"
+VERSION = "3.3.0-fast"
 APP_TITLE = "rg-search - A/B/C Field Search"
 APP_VERSION = VERSION
 
@@ -72,6 +70,7 @@ EXPORT_LABEL_TO_VALUE = {
 }
 EXPORT_VALUE_TO_LABEL = {value: label for label, value in EXPORT_LABEL_TO_VALUE.items()}
 ABC_EXPORT_COLUMNS = ["A", "B", "C", "file", "line", "source_line", "matches"]
+ABC_TEXT_SEPARATOR = "\x1f"
 
 
 @dataclass
@@ -134,7 +133,7 @@ class MemoryDeduper:
     def __init__(self) -> None:
         self._seen = set()
 
-    def is_duplicate(self, key: str) -> bool:
+    def is_duplicate(self, key: object) -> bool:
         if key in self._seen:
             return True
         self._seen.add(key)
@@ -143,29 +142,6 @@ class MemoryDeduper:
     def close(self) -> None:
         return None
 
-
-class SQLiteDeduper:
-    def __init__(self, db_path: Path, flush_every: int = 10000) -> None:
-        self.db_path = db_path
-        self.flush_every = max(1, flush_every)
-        self.ops = 0
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA temp_store=MEMORY")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS seen (k TEXT PRIMARY KEY)")
-        self.conn.commit()
-
-    def is_duplicate(self, key: str) -> bool:
-        cur = self.conn.execute("INSERT OR IGNORE INTO seen(k) VALUES (?)", (key,))
-        self.ops += 1
-        if self.ops % self.flush_every == 0:
-            self.conn.commit()
-        return cur.rowcount == 0
-
-    def close(self) -> None:
-        self.conn.commit()
-        self.conn.close()
 
 
 class ResultWriter:
@@ -584,21 +560,17 @@ def normalize_for_dedupe(text: str, args: argparse.Namespace) -> str:
     return value
 
 
-def make_dedupe_key(hit: Hit, args: argparse.Namespace) -> str:
+def make_dedupe_key(hit: Hit, args: argparse.Namespace) -> object:
     if args.dedupe == "none":
-        return ""
+        return None
     content = normalize_for_dedupe(hit.content, args)
-    file_path = str(Path(hit.file).resolve()) if hit.file else ""
+    # Avoid Path.resolve() per hit; rg already emits a stable path string for this run.
+    file_path = hit.file or ""
     if args.dedupe == "content":
-        raw = content
-    elif args.dedupe == "file-content":
-        raw = f"{file_path}\0{content}"
-    elif args.dedupe == "line":
-        raw = f"{file_path}\0{hit.line}\0{content}"
-    else:
-        raw = f"{file_path}\0{hit.line}\0{content}"
-    return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
-
+        return content
+    if args.dedupe == "file-content":
+        return (file_path, content)
+    return (file_path, hit.line, content)
 
 def load_keywords(args: argparse.Namespace) -> List[str]:
     keywords: List[str] = []
@@ -704,23 +676,82 @@ def build_rg_cmd(args: argparse.Namespace, pattern_file: Path) -> List[str]:
     return cmd
 
 
-def build_abc_candidate_rg_cmd(args: argparse.Namespace, pattern_file: Path) -> List[str]:
-    """Use ripgrep to stream lines containing ':'; field filtering happens in Python."""
+def regex_needs_field_scan(pattern: str) -> bool:
+    """Return True when a regex is likely anchored to a field instead of a full line."""
+    return pattern.startswith("^") or pattern.endswith("$") or "\\A" in pattern or "\\Z" in pattern or "\\z" in pattern
+
+
+def abc_candidate_mode(args: argparse.Namespace, keywords: Sequence[str]) -> str:
+    requested = getattr(args, "abc_candidate_mode", "auto")
+    if requested in {"keyword", "colon"}:
+        return requested
+    if not args.regex:
+        return "keyword"
+    if any(regex_needs_field_scan(keyword) for keyword in keywords):
+        return "colon"
+    return "keyword"
+
+
+def build_abc_candidate_rg_cmd(args: argparse.Namespace, pattern_file: Path, mode: str) -> List[str]:
+    """Build the fastest safe ripgrep candidate scan for A/B/C mode.
+
+    This uses ripgrep plain text output instead of --json to avoid JSON parsing
+    overhead. A non-printing field separator keeps URL/content colons parse-safe.
+    """
     cmd = [
         args.rg_bin,
-        "--json",
         "--line-number",
         "--column",
         "--with-filename",
+        "--no-heading",
         "--color",
         "never",
+        "--field-match-separator",
+        ABC_TEXT_SEPARATOR,
         "--threads",
         str(args.threads),
     ]
     add_common_rg_options(cmd, args)
-    cmd.extend(["--fixed-strings", "--case-sensitive", "--file", str(pattern_file)])
+    if mode == "colon":
+        cmd.extend(["--fixed-strings", "--case-sensitive"])
+    else:
+        if args.regex:
+            # A/B/C records are single-line; multiline makes plain output ambiguous.
+            pass
+        else:
+            cmd.append("--fixed-strings")
+        if args.ignore_case:
+            cmd.append("--ignore-case")
+        elif args.case_sensitive:
+            cmd.append("--case-sensitive")
+        else:
+            cmd.append("--smart-case")
+    cmd.extend(["--file", str(pattern_file)])
     cmd.extend(args.path)
     return cmd
+
+
+def hit_from_rg_text_line(raw_line: str) -> Optional[Hit]:
+    """Parse ripgrep text output: file<US>line<US>column<US>content."""
+    text = raw_line.rstrip("\r\n")
+    parts = text.split(ABC_TEXT_SEPARATOR, 3)
+    if len(parts) != 4:
+        return None
+    file_path, line_text, column_text, content = parts
+    try:
+        line_number = int(line_text)
+        column = int(column_text)
+    except ValueError:
+        return None
+    return Hit(
+        file=file_path,
+        line=line_number,
+        column=column,
+        content=content,
+        matches=[],
+        submatches=[],
+        absolute_offset=None,
+    )
 
 
 def validate_common_args(args: argparse.Namespace) -> None:
@@ -742,14 +773,10 @@ def validate_common_args(args: argparse.Namespace) -> None:
 
 
 def make_deduper(args: argparse.Namespace, output_path: Path):
+    _ = output_path
     if args.dedupe == "none":
         return None, None
-    if args.dedupe_store == "memory":
-        return MemoryDeduper(), None
-    db_path = Path(args.dedupe_db) if args.dedupe_db else output_path.with_suffix(output_path.suffix + ".dedupe.sqlite")
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    return SQLiteDeduper(db_path, flush_every=args.flush_every), db_path
-
+    return MemoryDeduper(), None
 
 def print_progress(raw_matches: int, written: int, duplicates: int, started: float) -> None:
     elapsed = max(time.time() - started, 0.001)
@@ -912,6 +939,8 @@ def search_abc_rows(
     keywords: Sequence[str],
     progress: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    row_sink: Optional[Callable[[TripleRow], None]] = None,
+    collect_rows: bool = True,
 ) -> ABCSearchResult:
     ignore_case = should_ignore_case_for_fields(args, keywords)
     try:
@@ -919,14 +948,20 @@ def search_abc_rows(
     except re.error as exc:
         raise ValueError(f"invalid regex: {exc}") from exc
 
-    candidate_pattern_file = create_pattern_file([":"])
+    mode = abc_candidate_mode(args, keywords)
+    candidate_terms = [":"] if mode == "colon" else keywords
+    candidate_pattern_file = create_pattern_file(candidate_terms)
     rows: List[TripleRow] = []
+    seen_triples = set()
     raw_matches = 0
     parsed_triples = 0
     field_hits = 0
+    written_rows = 0
+    duplicates_removed = 0
     file_counts: Counter[str] = Counter()
     rg_summary: Dict[str, object] = {}
     return_code: Optional[int] = None
+    limited = False
     started = time.time()
     cmd: List[str] = []
 
@@ -935,7 +970,7 @@ def search_abc_rows(
             progress(message)
 
     try:
-        cmd = build_abc_candidate_rg_cmd(args, candidate_pattern_file)
+        cmd = build_abc_candidate_rg_cmd(args, candidate_pattern_file, mode)
         if args.debug:
             emit("cmd=" + shlex.join(cmd))
         stderr_target = None if args.debug else subprocess.DEVNULL
@@ -946,34 +981,24 @@ def search_abc_rows(
             text=True,
             encoding="utf-8",
             errors="replace",
-            bufsize=1,
+            bufsize=1024 * 1024,
         )
         assert proc.stdout is not None
         for raw_line in proc.stdout:
             if cancel_event is not None and cancel_event.is_set():
                 proc.terminate()
                 raise RuntimeError("search cancelled")
-            try:
-                obj = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
-            obj_type = obj.get("type")
-            if obj_type == "summary":
-                data = obj.get("data", {})
-                if isinstance(data, dict):
-                    rg_summary = data
-                continue
-            if obj_type != "match":
-                continue
-            data = obj.get("data", {})
-            if not isinstance(data, dict):
+            hit = hit_from_rg_text_line(raw_line)
+            if hit is None:
                 continue
             raw_matches += 1
-            hit = hit_from_rg_match(data)
             parsed = split_abc_line(hit.content)
             if parsed is None:
                 if not args.quiet and raw_matches % args.progress_every == 0:
-                    emit(f"progress raw={raw_matches:,} parsed={parsed_triples:,} matched={field_hits:,}")
+                    emit(
+                        f"progress candidate={raw_matches:,} parsed={parsed_triples:,} "
+                        f"matched={field_hits:,} unique={written_rows:,} dup={duplicates_removed:,}"
+                    )
                 continue
             parsed_triples += 1
             a, b, c = parsed
@@ -988,12 +1013,28 @@ def search_abc_rows(
             )
             matched_terms = matcher.matched_terms(row)
             if matched_terms:
-                row = replace(row, matches=tuple(matched_terms))
-                rows.append(row)
                 field_hits += 1
-                file_counts[row.file] += 1
+                key = (row.a, row.b, row.c)
+                if key in seen_triples:
+                    duplicates_removed += 1
+                else:
+                    seen_triples.add(key)
+                    row = replace(row, matches=tuple(matched_terms))
+                    if row_sink is not None:
+                        row_sink(row)
+                    if collect_rows:
+                        rows.append(row)
+                    written_rows += 1
+                    file_counts[row.file] += 1
+                    if args.limit is not None and written_rows >= args.limit:
+                        limited = True
+                        proc.terminate()
+                        break
             if not args.quiet and raw_matches % args.progress_every == 0:
-                emit(f"progress raw={raw_matches:,} parsed={parsed_triples:,} matched={field_hits:,}")
+                emit(
+                    f"progress candidate={raw_matches:,} parsed={parsed_triples:,} "
+                    f"matched={field_hits:,} unique={written_rows:,} dup={duplicates_removed:,}"
+                )
 
         try:
             return_code = proc.wait(timeout=5)
@@ -1003,15 +1044,9 @@ def search_abc_rows(
     finally:
         safe_unlink(candidate_pattern_file)
 
-    deduped_rows = dedupe_and_sort_rows(rows)
-    duplicates_removed = len(rows) - len(deduped_rows)
-    limited = False
-    if args.limit is not None and len(deduped_rows) > args.limit:
-        deduped_rows = deduped_rows[: args.limit]
-        limited = True
     elapsed = time.time() - started
     return ABCSearchResult(
-        rows=deduped_rows,
+        rows=rows,
         raw_matches=raw_matches,
         parsed_triples=parsed_triples,
         field_hits=field_hits,
@@ -1025,7 +1060,6 @@ def search_abc_rows(
         command=shlex.join(cmd) if cmd else "",
     )
 
-
 def run_abc_cli(args: argparse.Namespace) -> int:
     validate_common_args(args)
     keywords = load_keywords(args)
@@ -1037,24 +1071,27 @@ def run_abc_cli(args: argparse.Namespace) -> int:
     if not args.no_summary:
         summary_path = Path(args.summary).resolve() if args.summary else output_path.with_suffix(output_path.suffix + ".summary.json")
 
+    mode = abc_candidate_mode(args, keywords)
     if not args.quiet:
         print(f"rg-search v{VERSION} A/B/C mode")
         print(
             f"keywords={len(keywords):,} field={args.field} mode={'regex' if args.regex else 'fixed'} "
-            f"dedupe=A->B->C"
+            f"dedupe=A->B->C memory-set candidate={mode}"
         )
         print(f"output={output_path}")
-        print("A/B/C field filtering is applied after parsing candidate lines, so B/C regex anchors are field-accurate.")
-
-    result = search_abc_rows(
-        args,
-        keywords,
-        progress=(lambda msg: print(msg, flush=True)) if not args.quiet else None,
-    )
+        if mode == "keyword":
+            print("A/B/C mode uses ripgrep keyword prefilter plus non-JSON streaming, then field-accurate parsing/filtering.")
+        else:
+            print("A/B/C regex anchors detected; scanning ':' candidates for field-accurate regex matching.")
 
     with TripleWriter(output_path, args.format) as writer:
-        for row in result.rows:
-            writer.write(row)
+        result = search_abc_rows(
+            args,
+            keywords,
+            progress=(lambda msg: print(msg, flush=True)) if not args.quiet else None,
+            row_sink=writer.write,
+            collect_rows=False,
+        )
 
     summary = {
         "version": VERSION,
@@ -1065,12 +1102,13 @@ def run_abc_cli(args: argparse.Namespace) -> int:
         "format": args.format,
         "keywords_count": len(keywords),
         "field": args.field,
+        "candidate_mode": mode,
         "search_mode": "regex" if args.regex else "fixed",
-        "dedupe": "A->B->C exact triple",
+        "dedupe": "A->B->C exact triple in memory",
         "raw_candidate_lines": result.raw_matches,
         "parsed_triples": result.parsed_triples,
         "field_hits_before_dedupe": result.field_hits,
-        "written_results": len(result.rows),
+        "written_results": result.field_hits - result.duplicates_removed,
         "duplicates_removed": result.duplicates_removed,
         "files_with_written_hits": result.files_with_hits,
         "top_files": result.top_files,
@@ -1083,17 +1121,19 @@ def run_abc_cli(args: argparse.Namespace) -> int:
     if summary_path is not None:
         write_summary(summary_path, summary)
     if not args.quiet:
+        written = result.field_hits - result.duplicates_removed
         print(
-            f"done raw={result.raw_matches:,} parsed={result.parsed_triples:,} "
-            f"matched={result.field_hits:,} written={len(result.rows):,} "
+            f"done candidate={result.raw_matches:,} parsed={result.parsed_triples:,} "
+            f"matched={result.field_hits:,} written={written:,} "
             f"dup={result.duplicates_removed:,} elapsed={result.elapsed_seconds:.2f}s"
         )
         if summary_path is not None:
             print(f"summary={summary_path}")
+    if result.limited:
+        return 0
     if result.rg_return_code in (0, 1, None):
         return 0
     return int(result.rg_return_code)
-
 
 @dataclass
 class GuiSearchConfig:
@@ -1646,17 +1686,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dedupe-store",
-        choices=["memory", "sqlite"],
+        choices=["memory"],
         default="memory",
-        help="Store used for normal-mode de-duplication keys.",
+        help="De-duplication store. Only memory is supported for maximum speed.",
     )
-    parser.add_argument("--dedupe-db", default=None, help="SQLite de-duplication DB path when --dedupe-store sqlite.")
-    parser.add_argument("--keep-dedupe-db", action="store_true", help="Keep auto-created SQLite de-duplication DB after the run.")
     parser.add_argument("--dedupe-trim", action="store_true", default=True, help="Trim content before de-duplication.")
     parser.add_argument("--no-dedupe-trim", dest="dedupe_trim", action="store_false", help="Do not trim content before de-duplication.")
     parser.add_argument("--dedupe-collapse-space", action="store_true", help="Collapse whitespace before de-duplication.")
     parser.add_argument("--dedupe-ignore-case", action="store_true", help="Ignore case when de-duplicating.")
-    parser.add_argument("--flush-every", type=int, default=10000, help="SQLite commit interval.")
     parser.add_argument("--progress-every", type=int, default=10000, help="Print progress every N raw matches.")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output.")
     parser.add_argument("--debug", action="store_true", help="Print ripgrep command and forward stderr.")
@@ -1668,6 +1705,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=["ANY", "A", "B", "C", "any", "a", "b", "c"],
         default=None,
         help="A/B/C field to search. Passing --field also enables --abc.",
+    )
+    parser.add_argument(
+        "--abc-candidate-mode",
+        choices=["auto", "keyword", "colon"],
+        default="auto",
+        help="A/B/C candidate scan mode. auto uses keyword prefilter for speed and colon scan only when needed.",
     )
     args = parser.parse_args(argv)
     if args.field is not None:
