@@ -1688,13 +1688,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    args = parse_args(raw_argv)
+
     if args.self_test:
         return run_self_test()
-    if args.gui:
+
+    # 默认无参数时打开 GUI：
+    #   python3 rgs.py
+    # 有参数时仍然走 CLI：
+    #   python3 rgs.py -p ./data -k test --field B
+    if args.gui or len(raw_argv) == 0:
         return run_gui()
+
     if args.abc:
         return run_abc_cli(args)
+
     return run_normal_cli(args)
 
 
