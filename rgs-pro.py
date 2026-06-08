@@ -18,8 +18,10 @@ A:B:C field-search examples:
   python3 rgs.py -p ./data -k "example.com" --abc --field A --format csv
   python3 rgs.py -p ./data -k "^admin" --abc --field B --regex --format csv
 
-GUI:
-  python3 rgs.py --gui
+启动方式:
+  python3 rgs.py              # 先交互选择 CLI 或 GUI
+  python3 rgs.py --cli        # 直接进入交互式 CLI
+  python3 rgs.py --gui        # 直接进入 GUI
 """
 from __future__ import annotations
 
@@ -52,7 +54,7 @@ except Exception:  # pragma: no cover - headless/minimal Python installs
     messagebox = None  # type: ignore[assignment]
     ttk = None  # type: ignore[assignment]
 
-VERSION = "4.0.0-ultra-abc"
+VERSION = "4.2.0-ultra-abc-menu"
 APP_TITLE = "rg-search - A/B/C Field Search"
 APP_VERSION = VERSION
 
@@ -2187,11 +2189,204 @@ def run_self_test() -> int:
     return 0
 
 
+
+def _interactive_read_lines(title: str, required: bool = True, default: Optional[List[str]] = None) -> List[str]:
+    """Read one value per line from stdin until a blank line."""
+    print(title)
+    print("  每行一个，直接回车结束。")
+    values: List[str] = []
+    while True:
+        try:
+            raw = input("> ").strip().strip('"\'')
+        except EOFError:
+            break
+        if not raw:
+            break
+        values.append(raw)
+    if values:
+        return values
+    if default is not None:
+        return default
+    if required:
+        raise SystemExit("已取消：必填项为空。")
+    return []
+
+
+def _interactive_prompt(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = input(f"{label}{suffix}: ").strip()
+    except EOFError:
+        value = ""
+    return value if value else default
+
+
+def _interactive_yes_no(label: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    try:
+        value = input(f"{label} [{suffix}]: ").strip().lower()
+    except EOFError:
+        value = ""
+    if not value:
+        return default
+    return value in {"y", "yes", "1", "true", "t", "是", "对", "好"}
+
+
+def _interactive_choice(label: str, choices: Sequence[str], default: str) -> str:
+    normalized = {item.lower(): item for item in choices}
+    while True:
+        value = _interactive_prompt(f"{label} ({'/'.join(choices)})", default).lower()
+        if value in normalized:
+            return normalized[value]
+        print(f"无效输入：{value}，可选：{', '.join(choices)}")
+
+
+def _interactive_desktop_default(filename: str) -> str:
+    desktop = Path.home() / "Desktop"
+    if desktop.exists():
+        return str(desktop / filename)
+    return filename
+
+
+def run_interactive_cli() -> int:
+    """Chinese interactive CLI wizard optimized for A/B/C datasets."""
+    print("=" * 64)
+    print(f"rg-search v{VERSION} 交互式 CLI - A/B/C 极速检索")
+    print("=" * 64)
+    print("默认走最快路径：ripgrep 粗筛 -> 边解析 A:B:C -> 字段匹配 -> 内存去重 -> 边写出。")
+    print("适合本地授权安全测试、数据自查和三段式文本审计。")
+    print()
+
+    try:
+        paths = _interactive_read_lines("请输入要检索的文件或目录路径", required=True)
+        keywords = _interactive_read_lines("请输入关键词或正则表达式", required=True)
+        field = _interactive_choice("检索字段", ["A", "B", "C", "ANY"], "B")
+        regex = _interactive_yes_no("是否使用正则匹配？固定字符串最快", False)
+
+        case_mode = _interactive_choice("大小写模式", ["smart", "ignore", "case"], "smart")
+        fmt = _interactive_choice("输出格式", ["csv", "txt", "jsonl", "md"], "csv")
+        columns = _interactive_choice("输出列模式：abc 最快，full 包含文件/行号/原始行", ["abc", "full"], "abc")
+        parse_mode = _interactive_choice(
+            "解析模式：urlpath 适合 URL/path:B:C，simple 适合 A 永不含冒号",
+            ["urlpath", "url", "simple"],
+            "urlpath",
+        )
+
+        default_ext = {"csv": "csv", "txt": "txt", "jsonl": "jsonl", "md": "md"}[fmt]
+        output = _interactive_prompt("输出文件", _interactive_desktop_default(f"rg_abc_results.{default_ext}"))
+        glob_line = _interactive_prompt("include glob，多个用英文逗号分隔，留空表示不过滤", "*.txt")
+        exclude_line = _interactive_prompt("exclude glob，多个用英文逗号分隔，留空表示不排除", "")
+        max_filesize = _interactive_prompt("跳过大文件，例如 200M；留空不限", "")
+        limit = _interactive_prompt("最多写出多少条去重结果，0 表示不限", "0")
+
+        dedupe = _interactive_yes_no("是否按 A+B+C 精确去重？推荐开启", True)
+        quiet = _interactive_yes_no("是否启用极速静默模式？推荐开启，速度更快", True)
+        no_summary = _interactive_yes_no("是否跳过 summary JSON？推荐跳过，速度更快", True)
+        all_files = _interactive_yes_no("是否扫描隐藏/忽略/二进制文本？普通 txt 数据建议关闭", False)
+        debug = _interactive_yes_no("是否打印底层 rg 命令用于调试？", False)
+        keep_matches = False
+        if columns == "full":
+            keep_matches = _interactive_yes_no("full 模式是否填充 matches 列？关闭更快", False)
+    except KeyboardInterrupt:
+        print("\n已取消。")
+        return 130
+
+    argv: List[str] = ["-p", *paths, "-k", *keywords, "--field", field, "--format", fmt, "-o", output]
+    argv.extend(["--abc-columns", columns, "--abc-parse", parse_mode, "--abc-candidate-mode", "auto"])
+    if regex:
+        argv.append("--regex")
+    if case_mode == "ignore":
+        argv.append("--ignore-case")
+    elif case_mode == "case":
+        argv.append("--case-sensitive")
+    else:
+        argv.append("--smart-case")
+    if not dedupe:
+        argv.extend(["--dedupe", "none"])
+    if quiet:
+        argv.append("--quiet")
+    if no_summary:
+        argv.append("--no-summary")
+    if all_files:
+        argv.append("--all")
+    if debug:
+        argv.append("--debug")
+    if keep_matches:
+        argv.append("--abc-keep-matches")
+    if max_filesize:
+        argv.extend(["--max-filesize", max_filesize])
+    try:
+        limit_int = int(limit or "0")
+    except ValueError:
+        raise SystemExit("limit 必须是整数。")
+    if limit_int > 0:
+        argv.extend(["--limit", str(limit_int)])
+    for item in [x.strip() for x in glob_line.split(",") if x.strip()]:
+        argv.extend(["--glob", item])
+    for item in [x.strip() for x in exclude_line.split(",") if x.strip()]:
+        argv.extend(["--exclude", item])
+
+    print("\n即将执行极速 A/B/C 检索。")
+    if debug:
+        print("参数：" + shlex.join(argv))
+    started = time.time()
+    args = parse_args(argv)
+    rc = run_abc_cli(args)
+    elapsed = time.time() - started
+    print(f"\n完成。输出文件：{Path(output).resolve()}")
+    print(f"总耗时：{elapsed:.3f} 秒")
+    return rc
+
+
+def run_startup_selector() -> int:
+    """Ask the user whether to launch interactive CLI or GUI when no args are supplied."""
+    print("=" * 64)
+    print(f"rg-search v{VERSION}")
+    print("请选择启动方式 / Choose startup mode")
+    print("=" * 64)
+    print("1) CLI 交互式极速检索（推荐大数据量 / fastest for large A:B:C files）")
+    print("2) GUI 图形界面（适合少量结果预览 / visual workflow）")
+    print("q) 退出")
+    print()
+
+    while True:
+        try:
+            choice = input("请输入 1/2/q，直接回车默认 CLI: ").strip().lower()
+        except EOFError:
+            # Non-interactive shell: prefer CLI wizard because it fails clearly on missing input
+            # instead of trying to open a GUI on a headless machine.
+            choice = "1"
+        except KeyboardInterrupt:
+            print("\n已取消。")
+            return 130
+
+        if choice in {"", "1", "cli", "c", "命令行"}:
+            return run_interactive_cli()
+        if choice in {"2", "gui", "g", "图形", "图形界面"}:
+            return run_gui()
+        if choice in {"q", "quit", "exit", "退出"}:
+            print("已退出。")
+            return 0
+        print("无效输入，请输入 1、2 或 q。")
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fast local folder content search with ripgrep, GUI, and A/B/C field mode."
     )
     parser.add_argument("--gui", action="store_true", help="Launch the merged Tkinter GUI.")
+    parser.add_argument(
+        "--interactive",
+        "--cli",
+        "-i",
+        dest="interactive_cli",
+        action="store_true",
+        help="Launch the Chinese interactive CLI wizard for fast A/B/C search.",
+    )
+    parser.add_argument(
+        "--menu",
+        action="store_true",
+        help="Show the startup menu to choose interactive CLI or GUI.",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run built-in parser/export tests and exit.")
     parser.add_argument("-p", "--path", nargs="+", default=[], help="Folder or file path to search.")
     parser.add_argument("-k", "--keywords", nargs="*", default=[], help="Keywords or patterns to search.")
@@ -2305,16 +2500,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     raw_argv = list(argv if argv is not None else sys.argv[1:])
+
+    # 无参数运行时，先交互选择 CLI 或 GUI：
+    #   python3 rgs.py
+    # 直接指定入口仍然保留：
+    #   python3 rgs.py --cli
+    #   python3 rgs.py --gui
+    # 带完整参数时不打断自动化脚本，直接走对应 CLI：
+    #   python3 rgs.py -p ./data -k test --field B
+    if len(raw_argv) == 0:
+        return run_startup_selector()
+
     args = parse_args(raw_argv)
 
     if args.self_test:
         return run_self_test()
 
-    # 默认无参数时打开 GUI：
-    #   python3 rgs.py
-    # 有参数时仍然走 CLI：
-    #   python3 rgs.py -p ./data -k test --field B
-    if args.gui or len(raw_argv) == 0:
+    if getattr(args, "menu", False):
+        return run_startup_selector()
+
+    if getattr(args, "interactive_cli", False):
+        return run_interactive_cli()
+
+    if args.gui:
         return run_gui()
 
     if args.abc:
