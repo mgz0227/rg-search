@@ -1,0 +1,107 @@
+name: Build rg-search native
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-and-windows:
+    name: Build Linux binary and Windows exe on Ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install compilers and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ mingw-w64 zip file
+
+      - name: Locate native source directory
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "rgs-native/src/rgs.cpp" ]; then
+            echo "src_dir=rgs-native" >> "$GITHUB_OUTPUT"
+          elif [ -f "rgs_native/src/rgs.cpp" ]; then
+            echo "src_dir=rgs_native" >> "$GITHUB_OUTPUT"
+          elif [ -f "src/rgs.cpp" ]; then
+            echo "src_dir=." >> "$GITHUB_OUTPUT"
+          else
+            echo "Cannot find rgs.cpp. Expected rgs-native/src/rgs.cpp, rgs_native/src/rgs.cpp, or src/rgs.cpp" >&2
+            find . -maxdepth 4 -type f -name 'rgs.cpp' -print >&2
+            exit 1
+          fi
+
+      - name: Build Linux x64 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          SRC_DIR="${{ steps.locate.outputs.src_dir }}"
+          g++ -std=c++20 -O3 -DNDEBUG -pthread "$SRC_DIR/src/rgs.cpp" -o dist/rgs-linux-x64
+          strip dist/rgs-linux-x64 || true
+          chmod +x dist/rgs-linux-x64
+          ./dist/rgs-linux-x64 --self-test
+          file dist/rgs-linux-x64
+
+      - name: Build Windows x64 exe with MinGW-w64
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC_DIR="${{ steps.locate.outputs.src_dir }}"
+          x86_64-w64-mingw32-g++ -std=c++20 -O3 -DNDEBUG \
+            -static -static-libgcc -static-libstdc++ \
+            "$SRC_DIR/src/rgs.cpp" -o dist/rgs-windows-x64.exe -lws2_32
+          x86_64-w64-mingw32-strip dist/rgs-windows-x64.exe || true
+          file dist/rgs-windows-x64.exe
+
+      - name: Copy documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC_DIR="${{ steps.locate.outputs.src_dir }}"
+          cp "$SRC_DIR/README.md" dist/README.md 2>/dev/null || cp README.md dist/README.md 2>/dev/null || true
+          cp "$SRC_DIR/README_EN.md" dist/README_EN.md 2>/dev/null || cp README_EN.md dist/README_EN.md 2>/dev/null || true
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          zip -9 rg-search-native-linux-x64.zip rgs-linux-x64 README.md README_EN.md 2>/dev/null || zip -9 rg-search-native-linux-x64.zip rgs-linux-x64
+          zip -9 rg-search-native-windows-x64.zip rgs-windows-x64.exe README.md README_EN.md 2>/dev/null || zip -9 rg-search-native-windows-x64.zip rgs-windows-x64.exe
+          sha256sum rg-search-native-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rg-search-native-builds
+          path: |
+            dist/rg-search-native-linux-x64.zip
+            dist/rg-search-native-windows-x64.zip
+            dist/SHA256SUMS.txt
+
+      - name: Create GitHub Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rg-search-native-linux-x64.zip
+            dist/rg-search-native-windows-x64.zip
+            dist/SHA256SUMS.txt
+          tag_name: ${{ github.ref_name }}
+          name: rg-search ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
