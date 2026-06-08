@@ -43,15 +43,46 @@ jobs:
             exit 1
           fi
 
-      - name: Guard source console fix
+      - name: Guard console source fixes
         shell: bash
         run: |
           set -euo pipefail
           SRC_DIR="${{ steps.locate.outputs.src_dir }}"
-          grep -n '#include <winsock2.h>' "$SRC_DIR/src/rgs.cpp"
-          grep -n '#include <windows.h>' "$SRC_DIR/src/rgs.cpp"
-          grep -n 'std::unitbuf' "$SRC_DIR/src/rgs.cpp"
-          grep -n 'APP_VERSION = "5.0.1' "$SRC_DIR/src/rgs.cpp"
+          SRC="$SRC_DIR/src/rgs.cpp"
+
+          echo "Checking source: $SRC"
+
+          winsock_line=$(grep -n '#include <winsock2.h>' "$SRC" | head -n 1 | cut -d: -f1 || true)
+          windows_line=$(grep -n '#include <windows.h>' "$SRC" | head -n 1 | cut -d: -f1 || true)
+
+          if [ -z "$winsock_line" ] || [ -z "$windows_line" ]; then
+            echo "Missing Windows include lines." >&2
+            echo "Expected winsock2.h before windows.h." >&2
+            exit 1
+          fi
+
+          echo "winsock2.h line: $winsock_line"
+          echo "windows.h  line: $windows_line"
+
+          if [ "$winsock_line" -ge "$windows_line" ]; then
+            echo "Wrong include order: winsock2.h must be before windows.h." >&2
+            exit 1
+          fi
+
+          if ! grep -q 'std::cout << std::unitbuf' "$SRC"; then
+            echo "Missing std::cout << std::unitbuf; console output may stay blank." >&2
+            exit 1
+          fi
+
+          if ! grep -q 'std::cerr << std::unitbuf' "$SRC"; then
+            echo "Missing std::cerr << std::unitbuf; console error output may stay buffered." >&2
+            exit 1
+          fi
+
+          # Diagnostic only; do not make version text a hard requirement.
+          grep -n 'APP_VERSION' "$SRC" | head -n 3 || true
+          grep -n 'sync_with_stdio(false)' "$SRC" | head -n 3 || true
+          grep -n 'cin.tie' "$SRC" | head -n 3 || true
 
       - name: Build Linux x64 binary
         shell: bash
@@ -65,7 +96,7 @@ jobs:
           strip dist/rgs-linux-x64 || true
           chmod +x dist/rgs-linux-x64
           ./dist/rgs-linux-x64 --self-test
-          printf 'q\n' | ./dist/rgs-linux-x64 --menu
+          printf 'q\n' | timeout 10s ./dist/rgs-linux-x64 --menu
           file dist/rgs-linux-x64
 
       - name: Build Windows x64 exe with MinGW-w64
