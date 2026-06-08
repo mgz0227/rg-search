@@ -1117,7 +1117,7 @@ static void http_response(socket_t client, const std::string& body, const std::s
 }
 
 static void open_browser(int port) {
-    std::string url = "http://0.0.0.0:" + std::to_string(port) + "/";
+    std::string url = "http://127.0.0.1:" + std::to_string(port) + "/";
 #ifdef _WIN32
     std::string cmd = "start \"\" \"" + url + "\"";
 #elif __APPLE__
@@ -1248,14 +1248,14 @@ static int run_gui_server() {
     int port = 17627;
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     for (; port < 17700; ++port) {
         addr.sin_port = htons(static_cast<uint16_t>(port));
         if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) break;
     }
     if (port >= 17700) { std::cerr << "Cannot bind localhost port\n"; return 1; }
     if (listen(server_fd, 16) != 0) { std::cerr << "listen failed\n"; return 1; }
-    std::cout << "GUI running at http://0.0.0.0:" << port << "/\n";
+    std::cout << "GUI running at http://127.0.0.1:" << port << "/\n";
     std::cout << "Press Ctrl+C to stop.\n" << std::flush;
     open_browser(port);
     while (true) {
