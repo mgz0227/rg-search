@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build-linux-and-windows:
+  build:
     name: Build Linux binary and Windows exe on Ubuntu
     runs-on: ubuntu-latest
 
@@ -38,10 +38,20 @@ jobs:
           elif [ -f "src/rgs.cpp" ]; then
             echo "src_dir=." >> "$GITHUB_OUTPUT"
           else
-            echo "Cannot find rgs.cpp. Expected rgs-native/src/rgs.cpp, rgs_native/src/rgs.cpp, or src/rgs.cpp" >&2
+            echo "Cannot find rgs.cpp" >&2
             find . -maxdepth 4 -type f -name 'rgs.cpp' -print >&2
             exit 1
           fi
+
+      - name: Guard source console fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC_DIR="${{ steps.locate.outputs.src_dir }}"
+          grep -n '#include <winsock2.h>' "$SRC_DIR/src/rgs.cpp"
+          grep -n '#include <windows.h>' "$SRC_DIR/src/rgs.cpp"
+          grep -n 'std::unitbuf' "$SRC_DIR/src/rgs.cpp"
+          grep -n 'APP_VERSION = "5.0.1' "$SRC_DIR/src/rgs.cpp"
 
       - name: Build Linux x64 binary
         shell: bash
@@ -49,10 +59,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           SRC_DIR="${{ steps.locate.outputs.src_dir }}"
-          g++ -std=c++20 -O3 -DNDEBUG -pthread "$SRC_DIR/src/rgs.cpp" -o dist/rgs-linux-x64
+          g++ -std=c++20 -O3 -DNDEBUG -pthread \
+            -finput-charset=UTF-8 -fexec-charset=UTF-8 \
+            "$SRC_DIR/src/rgs.cpp" -o dist/rgs-linux-x64
           strip dist/rgs-linux-x64 || true
           chmod +x dist/rgs-linux-x64
           ./dist/rgs-linux-x64 --self-test
+          printf 'q\n' | ./dist/rgs-linux-x64 --menu
           file dist/rgs-linux-x64
 
       - name: Build Windows x64 exe with MinGW-w64
@@ -61,6 +74,7 @@ jobs:
           set -euo pipefail
           SRC_DIR="${{ steps.locate.outputs.src_dir }}"
           x86_64-w64-mingw32-g++ -std=c++20 -O3 -DNDEBUG \
+            -finput-charset=UTF-8 -fexec-charset=UTF-8 \
             -static -static-libgcc -static-libstdc++ \
             "$SRC_DIR/src/rgs.cpp" -o dist/rgs-windows-x64.exe -lws2_32
           x86_64-w64-mingw32-strip dist/rgs-windows-x64.exe || true
@@ -92,9 +106,41 @@ jobs:
             dist/rg-search-native-linux-x64.zip
             dist/rg-search-native-windows-x64.zip
             dist/SHA256SUMS.txt
+            dist/rgs-windows-x64.exe
+            dist/rgs-linux-x64
 
-      - name: Create GitHub Release on tag
-        if: startsWith(github.ref, 'refs/tags/')
+  test-windows-exe:
+    name: Test Windows exe on Windows runner
+    runs-on: windows-latest
+    needs: build
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rg-search-native-builds
+          path: dist
+
+      - name: Test Windows exe
+        shell: pwsh
+        run: |
+          .\dist\rgs-windows-x64.exe --self-test
+          "q" | .\dist\rgs-windows-x64.exe --menu
+
+  release:
+    name: Create GitHub Release on tag
+    runs-on: ubuntu-latest
+    needs: [build, test-windows-exe]
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rg-search-native-builds
+          path: dist
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |

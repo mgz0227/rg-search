@@ -32,9 +32,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <fcntl.h>
@@ -49,7 +49,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* APP_VERSION = "5.0.0-native-cpp";
+static constexpr const char* APP_VERSION = "5.0.2-native-cpp-console-visible";
 static constexpr char KEY_SEP = '\x1f';
 
 struct Args {
@@ -814,7 +814,7 @@ private:
     std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
 };
 
-static void print_stats(const Args& args, const Stats& stats, double elapsed) {
+[[maybe_unused]] static void print_stats(const Args& args, const Stats& stats, double elapsed) {
     if (args.quiet) return;
     std::cout << "\n完成 / Done\n";
     std::cout << "files_scanned=" << stats.files_scanned.load()
@@ -829,10 +829,11 @@ static void print_stats(const Args& args, const Stats& stats, double elapsed) {
 }
 
 static void print_help() {
-    std::cout << R"HELP(rgs-native v5.0.0
+    std::cout << R"HELP(rgs-native v5.0.1-console-fix
 
 用法 / Usage:
   rgs                 # 先选择 CLI 交互式或浏览器 GUI
+  rgs --menu          # 显示启动菜单
   rgs --cli           # 直接进入 CLI 交互式
   rgs --gui           # 打开本地浏览器 GUI
   rgs scan -p DATA -k KEY --field B -o result.csv --glob "*.txt"
@@ -919,7 +920,8 @@ static Args parse_args(int argc, char** argv, std::string* err) {
     std::string first = argv[1];
     if (first == "--help" || first == "-h" || first == "help") { args.help = true; return args; }
     if (first == "--self-test") { args.self_test = true; return args; }
-    if (first == "--cli" || first == "interactive") { args.interactive = true; return args; }
+    if (first == "--menu" || first == "menu") { return args; }
+    if (first == "--cli" || first == "interactive" || first == "cli") { args.interactive = true; return args; }
     if (first == "--gui" || first == "gui") { args.gui = true; return args; }
     if (first == "scan") {
         parse_scan_args(argc, argv, 2, args, err);
@@ -933,9 +935,9 @@ static Args parse_args(int argc, char** argv, std::string* err) {
 static std::string prompt_line(const std::string& label, const std::string& def = "") {
     std::cout << label;
     if (!def.empty()) std::cout << " [" << def << "]";
-    std::cout << ": ";
+    std::cout << ": " << std::flush;
     std::string s;
-    std::getline(std::cin, s);
+    if (!std::getline(std::cin, s)) return def;
     s = trim_copy(s);
     if (s.empty()) return def;
     return s;
@@ -952,9 +954,9 @@ static std::vector<std::string> prompt_multiline_keywords() {
     std::cout << "请输入关键词，一行一个；输入空行结束。\n";
     std::vector<std::string> ks;
     while (true) {
-        std::cout << "keyword> ";
+        std::cout << "keyword> " << std::flush;
         std::string s;
-        std::getline(std::cin, s);
+        if (!std::getline(std::cin, s)) break;
         s = trim_copy(s);
         if (s.empty()) break;
         ks.push_back(s);
@@ -985,7 +987,7 @@ static int run_scan(Args args) {
 }
 
 static int run_interactive_cli() {
-    std::cout << "\n=== rgs-native CLI 交互式极速检索 ===\n";
+    std::cout << "\n=== rgs-native CLI 交互式极速检索 ===\n" << std::flush;
     Args args;
     std::string path_line = prompt_line("检索路径，多个路径用 ; 分隔");
     args.paths = split_list(path_line, ';');
@@ -1123,7 +1125,8 @@ static void open_browser(int port) {
 #else
     std::string cmd = "xdg-open \"" + url + "\" >/dev/null 2>&1 &";
 #endif
-    std::system(cmd.c_str());
+    int browser_rc = std::system(cmd.c_str());
+    (void)browser_rc;
 }
 
 static Args args_from_form(const std::unordered_map<std::string, std::string>& f) {
@@ -1253,7 +1256,7 @@ static int run_gui_server() {
     if (port >= 17700) { std::cerr << "Cannot bind localhost port\n"; return 1; }
     if (listen(server_fd, 16) != 0) { std::cerr << "listen failed\n"; return 1; }
     std::cout << "GUI running at http://127.0.0.1:" << port << "/\n";
-    std::cout << "Press Ctrl+C to stop.\n";
+    std::cout << "Press Ctrl+C to stop.\n" << std::flush;
     open_browser(port);
     while (true) {
         sockaddr_in caddr{};
@@ -1272,17 +1275,18 @@ static int run_gui_server() {
 
 static int run_start_menu() {
     while (true) {
-        std::cout << "\n=== rgs-native v" << APP_VERSION << " ===\n";
-        std::cout << "1) CLI 交互式极速检索\n";
-        std::cout << "2) GUI 浏览器界面\n";
-        std::cout << "q) 退出\n";
-        std::cout << "请选择: ";
+        std::cout << "\n=== rgs-native v" << APP_VERSION << " ===\n"
+                  << "1) CLI 交互式极速检索\n"
+                  << "2) GUI 浏览器界面\n"
+                  << "q) 退出\n"
+                  << "请选择 [1]: " << std::flush;
         std::string s;
-        std::getline(std::cin, s);
+        if (!std::getline(std::cin, s)) return 0;
         s = trim_copy(lower_ascii(s));
-        if (s == "1" || s == "cli") return run_interactive_cli();
-        if (s == "2" || s == "gui") return run_gui_server();
+        if (s.empty() || s == "1" || s == "cli" || s == "c") return run_interactive_cli();
+        if (s == "2" || s == "gui" || s == "g") return run_gui_server();
         if (s == "q" || s == "quit" || s == "exit") return 0;
+        std::cout << "无效输入，请输入 1、2 或 q。\n" << std::flush;
     }
 }
 
@@ -1343,8 +1347,14 @@ static int self_test() {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
     std::ios::sync_with_stdio(false);
-    std::cin.tie(nullptr);
+    std::cin.tie(&std::cout);
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
     std::string err;
     Args args = parse_args(argc, argv, &err);
     if (!err.empty()) { std::cerr << err << "\n"; return 2; }
