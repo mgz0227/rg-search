@@ -3,6 +3,7 @@
 // No Python, no SQLite, no ripgrep subprocess in the default fast path.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -49,8 +51,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* APP_VERSION = "5.0.2-native-cpp-console-visible";
-static constexpr char KEY_SEP = '\x1f';
+static constexpr const char* APP_VERSION = "5.2.2-native-cpp-interactive-dedupe";
 
 struct Args {
     bool help = false;
@@ -58,6 +59,8 @@ struct Args {
     bool interactive = false;
     bool gui = false;
     bool scan = false;
+    bool dedupe_only = false;
+    bool dedupe_interactive = false;
     std::vector<std::string> paths;
     std::vector<std::string> keywords;
     std::vector<std::string> keyword_files;
@@ -321,6 +324,166 @@ static std::string sanitize_txt(std::string_view v) {
     return trim_copy(out);
 }
 
+static bool is_utf8_bom_at(std::string_view v, size_t i) {
+    return i + 3 <= v.size()
+        && static_cast<unsigned char>(v[i]) == 0xEF
+        && static_cast<unsigned char>(v[i + 1]) == 0xBB
+        && static_cast<unsigned char>(v[i + 2]) == 0xBF;
+}
+
+static bool is_zero_width_utf8_at(std::string_view v, size_t i) {
+    if (i + 3 > v.size()) return false;
+    const unsigned char a = static_cast<unsigned char>(v[i]);
+    const unsigned char b = static_cast<unsigned char>(v[i + 1]);
+    const unsigned char c = static_cast<unsigned char>(v[i + 2]);
+    return a == 0xE2 && b == 0x80 && c >= 0x8B && c <= 0x8F;
+}
+
+static std::string normalize_field_for_output(std::string_view v) {
+    // Use the same canonical form for output and A/B/C de-duplication. This
+    // removes BOM/zero-width bytes and normalizes control whitespace that can
+    // make two rows look identical but compare different internally.
+    v = trim_view(v);
+    std::string out;
+    out.reserve(v.size());
+    bool last_was_space = false;
+    for (size_t i = 0; i < v.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(v[i]);
+        if (is_utf8_bom_at(v, i)) { i += 2; continue; }
+        if (is_zero_width_utf8_at(v, i)) { i += 2; continue; }
+        if (i + 2 <= v.size() && c == 0xC2 && static_cast<unsigned char>(v[i + 1]) == 0xA0) {
+            if (!last_was_space) out.push_back(' ');
+            last_was_space = true;
+            ++i;
+            continue;
+        }
+        if (c < 0x20 || c == 0x7F) {
+            if (c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') {
+                if (!last_was_space) out.push_back(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        out.push_back(static_cast<char>(c));
+        last_was_space = (c == ' ');
+    }
+    return trim_copy(out);
+}
+
+struct OwnedTriple {
+    std::string a;
+    std::string b;
+    std::string c;
+    TripleView view() const { return TripleView{std::string_view(a), std::string_view(b), std::string_view(c)}; }
+};
+
+static OwnedTriple normalize_triple_for_output(const TripleView& t) {
+    return OwnedTriple{
+        normalize_field_for_output(t.a),
+        normalize_field_for_output(t.b),
+        normalize_field_for_output(t.c),
+    };
+}
+
+static std::string normalized_path_key(const fs::path& p) {
+    std::error_code ec;
+    fs::path abs = fs::absolute(p, ec);
+    if (ec) abs = p;
+    fs::path norm = abs.lexically_normal();
+    std::string key = norm.generic_string();
+#ifdef _WIN32
+    key = lower_ascii(key);
+#endif
+    return key;
+}
+
+static bool same_path_key(const fs::path& a, const fs::path& b) {
+    if (a.empty() || b.empty()) return false;
+    return normalized_path_key(a) == normalized_path_key(b);
+}
+
+static uint64_t current_process_id_number() {
+#ifdef _WIN32
+    return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+static fs::path make_temp_output_path(const fs::path& output) {
+    fs::path parent = output.parent_path();
+    std::string name = output.filename().generic_string();
+    if (name.empty()) name = "rgs_output";
+    auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::ostringstream os;
+    os << name << ".tmp." << current_process_id_number() << "." << tick;
+    return parent.empty() ? fs::path(os.str()) : (parent / os.str());
+}
+
+static bool looks_like_output_temp_file(const fs::path& candidate, const fs::path& output) {
+    std::string cname = candidate.filename().generic_string();
+    std::string oname = output.filename().generic_string();
+    if (oname.empty()) return false;
+    std::string prefix = oname + ".tmp.";
+#ifdef _WIN32
+    cname = lower_ascii(cname);
+    prefix = lower_ascii(prefix);
+#endif
+    return starts_with(cname, prefix);
+}
+
+static std::string regex_safe_copy(std::string_view v) {
+    // Keep regex mode stable on files that contain embedded NUL/control bytes.
+    // Fixed-string mode still scans the original bytes directly for maximum speed.
+    std::string out;
+    out.reserve(v.size());
+    for (unsigned char c : v) {
+        if ((c < 0x20 && c != '\t') || c == 0x7f) out.push_back(' ');
+        else out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+static void append_u64_le(std::string& out, uint64_t value) {
+    // Binary length prefixes make the A/B/C de-duplication key unambiguous and fast.
+    // std::string may safely contain NUL/control bytes, and unordered_set compares bytes exactly.
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<char>((value >> (i * 8)) & 0xffu));
+    }
+}
+
+static std::string make_abc_dedupe_key(const TripleView& t) {
+    // Exact A -> B -> C key.  This avoids delimiter-collision bugs when fields contain
+    // extra ':', control characters, URLs, or the old key separator byte.
+    std::string key;
+    key.reserve(t.a.size() + t.b.size() + t.c.size() + 24);
+    append_u64_le(key, static_cast<uint64_t>(t.a.size()));
+    key.append(t.a.data(), t.a.size());
+    append_u64_le(key, static_cast<uint64_t>(t.b.size()));
+    key.append(t.b.data(), t.b.size());
+    append_u64_le(key, static_cast<uint64_t>(t.c.size()));
+    key.append(t.c.data(), t.c.size());
+    return key;
+}
+
+class DedupeStore {
+public:
+    bool insert(std::string&& key) {
+        const size_t h = std::hash<std::string_view>{}(std::string_view(key.data(), key.size()));
+        Shard& shard = shards_[h & (SHARD_COUNT - 1)];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        return shard.keys.emplace(std::move(key)).second;
+    }
+private:
+    static constexpr size_t SHARD_COUNT = 256;
+    struct Shard {
+        std::mutex mutex;
+        std::unordered_set<std::string> keys;
+    };
+    static_assert((SHARD_COUNT & (SHARD_COUNT - 1)) == 0, "SHARD_COUNT must be power of two");
+    std::array<Shard, SHARD_COUNT> shards_{};
+};
+
 static std::optional<TripleView> parse_simple(std::string_view line) {
     line = trim_view(line);
     size_t i = line.find(':');
@@ -468,15 +631,21 @@ private:
 
 class Writer {
 public:
-    explicit Writer(const Args& args) : args_(args) {}
+    explicit Writer(const Args& args) : args_(args), final_path_(args.output) {}
+    ~Writer() {
+        if (!committed_ && !tmp_path_.empty()) {
+            std::error_code ec;
+            fs::remove(tmp_path_, ec);
+        }
+    }
 
     bool open() {
-        fs::path out(args_.output);
-        if (!out.parent_path().empty()) {
+        if (!final_path_.parent_path().empty()) {
             std::error_code ec;
-            fs::create_directories(out.parent_path(), ec);
+            fs::create_directories(final_path_.parent_path(), ec);
         }
-        fp_.open(args_.output, std::ios::binary | std::ios::trunc);
+        tmp_path_ = make_temp_output_path(final_path_);
+        fp_.open(tmp_path_, std::ios::binary | std::ios::trunc);
         if (!fp_) return false;
         if (args_.format == "csv") {
             fp_ << "\xEF\xBB\xBF";
@@ -512,10 +681,37 @@ public:
     }
 
     bool good() const { return static_cast<bool>(fp_); }
-    void flush() { fp_.flush(); }
+
+    bool close_and_commit(std::string* error_message = nullptr) {
+        fp_.flush();
+        if (!fp_) {
+            if (error_message) *error_message = "Failed while writing temporary output: " + tmp_path_.generic_string();
+            fp_.close();
+            return false;
+        }
+        fp_.close();
+        std::error_code ec;
+        fs::rename(tmp_path_, final_path_, ec);
+        if (ec) {
+            std::error_code remove_ec;
+            fs::remove(final_path_, remove_ec);
+            ec.clear();
+            fs::rename(tmp_path_, final_path_, ec);
+        }
+        if (ec) {
+            if (error_message) *error_message = "Cannot move temporary output into place: " + ec.message();
+            return false;
+        }
+        committed_ = true;
+        return true;
+    }
+
 private:
     const Args& args_;
+    fs::path final_path_;
+    fs::path tmp_path_;
     std::ofstream fp_;
+    bool committed_ = false;
 };
 
 class Matcher {
@@ -528,7 +724,11 @@ public:
         if (args.regex) {
             auto flags = std::regex::ECMAScript;
             if (args.ignore_case) flags |= std::regex::icase;
-            for (const auto& k : args.keywords) regexes_.emplace_back(k, flags);
+            for (const auto& k : args.keywords) {
+                bool match_all = (k == ".*" || k == "^.*$" || k == "^.*" || k == ".*$");
+                regex_match_all_.push_back(match_all);
+                regexes_.emplace_back(match_all ? "a^" : k, flags);
+            }
         }
     }
 
@@ -582,8 +782,15 @@ private:
         if (args_.keep_matches && matches) matches->clear();
         for (size_t i = 0; i < regexes_.size(); ++i) {
             bool hit = false;
-            for (auto f : fields) {
-                if (std::regex_search(f.begin(), f.end(), regexes_[i])) { hit = true; break; }
+            if (i < regex_match_all_.size() && regex_match_all_[i]) {
+                hit = !fields.empty();
+            } else {
+                for (auto f : fields) {
+                    // Regex mode is the slower path; copy and remove dangerous C0 controls
+                    // to avoid library crashes on binary-ish input lines.
+                    std::string value = regex_safe_copy(f);
+                    if (std::regex_search(value, regexes_[i])) { hit = true; break; }
+                }
             }
             if (hit) {
                 any = true;
@@ -601,6 +808,7 @@ private:
     const Args& args_;
     std::vector<std::string> fixed_;
     std::vector<std::regex> regexes_;
+    std::vector<bool> regex_match_all_;
 };
 
 class Scanner {
@@ -636,7 +844,7 @@ public:
             });
         }
         for (auto& t : workers) t.join();
-        writer.flush();
+        if (!writer.close_and_commit(error_message)) return false;
         write_summary(stats, files.size());
         return true;
     }
@@ -694,6 +902,17 @@ private:
 
     void add_file(const fs::path& p, std::vector<fs::path>& files, Stats& stats) {
         stats.files_seen.fetch_add(1, std::memory_order_relaxed);
+
+        // Never scan the output file, summary file, or stale temporary outputs.
+        // If output lives inside the search directory, reading old/current results
+        // back into the scanner is the most common cause of duplicate-looking rows.
+        fs::path output_path(args_.output);
+        if (!output_path.empty()) {
+            if (same_path_key(p, output_path)) return;
+            if (looks_like_output_temp_file(p, output_path)) return;
+        }
+        if (!args_.summary.empty() && same_path_key(p, fs::path(args_.summary))) return;
+
         if (!wildcard_match_any(args_.include_globs, p)) return;
         if (wildcard_excluded(args_.exclude_globs, p)) return;
         if (args_.max_filesize > 0) {
@@ -744,29 +963,27 @@ private:
         if (!matcher_.field_matches(*parsed, args_.keep_matches ? &matches : nullptr)) return;
         stats.field_hits.fetch_add(1, std::memory_order_relaxed);
 
-        std::string key;
-        if (args_.dedupe) {
-            key.reserve(parsed->a.size() + parsed->b.size() + parsed->c.size() + 2);
-            key.append(parsed->a);
-            key.push_back(KEY_SEP);
-            key.append(parsed->b);
-            key.push_back(KEY_SEP);
-            key.append(parsed->c);
-        }
+        // Normalize once and use the same A/B/C bytes for both output and de-dupe.
+        // This prevents visually identical TXT/CSV rows from being emitted twice
+        // because one source row contains a BOM, zero-width marker, or control space.
+        OwnedTriple normalized = normalize_triple_for_output(*parsed);
+        if (normalized.a.empty() || normalized.b.empty()) return;
+        TripleView out_triple = normalized.view();
 
-        std::lock_guard<std::mutex> lock(out_mutex_);
         if (args_.dedupe) {
-            auto [_, inserted] = seen_.insert(std::move(key));
-            if (!inserted) {
+            std::string key = make_abc_dedupe_key(out_triple);
+            if (!dedupe_.insert(std::move(key))) {
                 stats.duplicates.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
         }
+
+        std::lock_guard<std::mutex> lock(write_mutex_);
         if (args_.limit > 0 && stats.written.load(std::memory_order_relaxed) >= args_.limit) {
             stop_.store(true, std::memory_order_relaxed);
             return;
         }
-        writer_->write(*parsed, file_string, line_no, line, matches);
+        writer_->write(out_triple, file_string, line_no, line, matches);
         uint64_t w = stats.written.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!args_.quiet && args_.progress_every > 0 && w % args_.progress_every == 0) {
             const double e = elapsed_seconds();
@@ -808,11 +1025,271 @@ private:
     Args args_;
     Matcher matcher_;
     Writer* writer_ = nullptr;
-    std::mutex out_mutex_;
-    std::unordered_set<std::string> seen_;
+    std::mutex write_mutex_;
+    DedupeStore dedupe_;
     std::atomic<bool> stop_{false};
     std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
 };
+
+struct DedupeRecord {
+    std::string a;
+    std::string b;
+    std::string c;
+    std::string file;
+    std::string source_line;
+    uint64_t line = 0;
+
+    TripleView view() const {
+        return TripleView{std::string_view(a), std::string_view(b), std::string_view(c)};
+    }
+};
+
+static bool dedupe_record_less(const DedupeRecord& x, const DedupeRecord& y) {
+    if (x.a != y.a) return x.a < y.a;
+    if (x.b != y.b) return x.b < y.b;
+    if (x.c != y.c) return x.c < y.c;
+    if (x.file != y.file) return x.file < y.file;
+    return x.line < y.line;
+}
+
+static bool dedupe_record_equal_abc(const DedupeRecord& x, const DedupeRecord& y) {
+    return x.a == y.a && x.b == y.b && x.c == y.c;
+}
+
+class DirectoryDeduper {
+public:
+    explicit DirectoryDeduper(Args args) : args_(std::move(args)) {}
+
+    bool run(Stats& stats, std::string* error_message = nullptr) {
+        start_ = std::chrono::steady_clock::now();
+        if (args_.threads == 0) args_.threads = std::max(1u, std::thread::hardware_concurrency());
+        if (!validate(error_message)) return false;
+        std::vector<fs::path> files = collect_files(stats);
+        if (files.empty()) {
+            if (error_message) *error_message = "No input files matched the filters.";
+            return false;
+        }
+
+        std::atomic<size_t> index{0};
+        unsigned nthreads = std::min<unsigned>(args_.threads, static_cast<unsigned>(files.size()));
+        std::vector<std::thread> workers;
+        for (unsigned i = 0; i < nthreads; ++i) {
+            workers.emplace_back([&]() {
+                std::vector<DedupeRecord> local_rows;
+                local_rows.reserve(8192);
+                while (true) {
+                    size_t pos = index.fetch_add(1, std::memory_order_relaxed);
+                    if (pos >= files.size()) break;
+                    scan_file(files[pos], stats, local_rows);
+                }
+                if (!local_rows.empty()) {
+                    std::lock_guard<std::mutex> lock(rows_mutex_);
+                    rows_.insert(
+                        rows_.end(),
+                        std::make_move_iterator(local_rows.begin()),
+                        std::make_move_iterator(local_rows.end())
+                    );
+                }
+            });
+        }
+        for (auto& t : workers) t.join();
+
+        // This standalone mode intentionally reads everything first, then sorts
+        // by A -> B -> C and removes adjacent duplicates.
+        std::sort(rows_.begin(), rows_.end(), dedupe_record_less);
+
+        Writer writer(args_);
+        if (!writer.open()) {
+            if (error_message) *error_message = "Cannot open output file: " + args_.output;
+            return false;
+        }
+
+        bool have_prev = false;
+        DedupeRecord prev;
+        uint64_t unique_total = 0;
+        for (const auto& row : rows_) {
+            if (have_prev && dedupe_record_equal_abc(prev, row)) {
+                stats.duplicates.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            have_prev = true;
+            prev = row;
+            ++unique_total;
+            if (args_.limit == 0 || stats.written.load(std::memory_order_relaxed) < args_.limit) {
+                TripleView view = row.view();
+                writer.write(view, row.file, row.line, row.source_line, "");
+                stats.written.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        if (!writer.close_and_commit(error_message)) return false;
+        write_summary(stats, files.size(), unique_total);
+        return true;
+    }
+
+    double elapsed_seconds() const {
+        auto end = std::chrono::steady_clock::now();
+        std::chrono::duration<double> d = end - start_;
+        return d.count();
+    }
+
+private:
+    bool validate(std::string* err) {
+        if (args_.paths.empty()) { if (err) *err = "No path provided."; return false; }
+        std::string fmt = lower_ascii(args_.format);
+        if (!(fmt == "csv" || fmt == "txt" || fmt == "jsonl")) { if (err) *err = "format must be csv/txt/jsonl"; return false; }
+        std::string cols = lower_ascii(args_.columns);
+        if (!(cols == "abc" || cols == "full")) { if (err) *err = "columns must be abc/full"; return false; }
+        std::string pm = lower_ascii(args_.parse_mode);
+        if (!(pm == "simple" || pm == "url" || pm == "urlpath")) { if (err) *err = "parse mode must be simple/url/urlpath"; return false; }
+        args_.format = fmt;
+        args_.columns = cols;
+        args_.parse_mode = pm;
+        return true;
+    }
+
+    std::vector<fs::path> collect_files(Stats& stats) {
+        std::vector<fs::path> files;
+        for (const auto& raw : args_.paths) {
+            std::error_code ec;
+            fs::path root(raw);
+            if (!fs::exists(root, ec)) continue;
+            if (fs::is_regular_file(root, ec)) {
+                add_file(root, files, stats);
+            } else if (fs::is_directory(root, ec)) {
+                fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+                while (it != end) {
+                    const fs::path p = it->path();
+                    std::error_code ec2;
+                    if (it->is_directory(ec2)) {
+                        if (wildcard_excluded(args_.exclude_globs, p)) it.disable_recursion_pending();
+                    } else if (it->is_regular_file(ec2)) {
+                        add_file(p, files, stats);
+                    }
+                    it.increment(ec);
+                }
+            }
+        }
+        return files;
+    }
+
+    void add_file(const fs::path& p, std::vector<fs::path>& files, Stats& stats) {
+        stats.files_seen.fetch_add(1, std::memory_order_relaxed);
+
+        fs::path output_path(args_.output);
+        if (!output_path.empty()) {
+            if (same_path_key(p, output_path)) return;
+            if (looks_like_output_temp_file(p, output_path)) return;
+        }
+        if (!args_.summary.empty() && same_path_key(p, fs::path(args_.summary))) return;
+
+        if (!wildcard_match_any(args_.include_globs, p)) return;
+        if (wildcard_excluded(args_.exclude_globs, p)) return;
+        if (args_.max_filesize > 0) {
+            std::error_code ec;
+            auto sz = fs::file_size(p, ec);
+            if (!ec && sz > args_.max_filesize) return;
+        }
+        files.push_back(p);
+    }
+
+    void scan_file(const fs::path& path, Stats& stats, std::vector<DedupeRecord>& local_rows) {
+        MappedFile mf;
+        if (!mf.open_file(path)) { stats.errors.fetch_add(1, std::memory_order_relaxed); return; }
+        stats.files_scanned.fetch_add(1, std::memory_order_relaxed);
+        stats.bytes_scanned.fetch_add(static_cast<uint64_t>(mf.size()), std::memory_order_relaxed);
+        const char* base = mf.data();
+        size_t size = mf.size();
+        size_t pos = 0;
+        uint64_t line_no = 1;
+        std::string file_string;
+        if (args_.columns == "full") file_string = path.generic_string();
+        while (pos < size) {
+            const char* start = base + pos;
+            const void* nlptr = std::memchr(start, '\n', size - pos);
+            size_t len;
+            if (nlptr) len = static_cast<const char*>(nlptr) - start;
+            else len = size - pos;
+            if (len > 0 && start[len - 1] == '\r') --len;
+            std::string_view line(start, len);
+            stats.candidate_lines.fetch_add(1, std::memory_order_relaxed);
+            auto parsed = parse_triple(line, args_.parse_mode);
+            if (parsed) {
+                OwnedTriple normalized = normalize_triple_for_output(*parsed);
+                if (!normalized.a.empty() && !normalized.b.empty()) {
+                    DedupeRecord record;
+                    record.a = std::move(normalized.a);
+                    record.b = std::move(normalized.b);
+                    record.c = std::move(normalized.c);
+                    if (args_.columns == "full") {
+                        record.file = file_string;
+                        record.line = line_no;
+                        record.source_line.assign(line.data(), line.size());
+                    }
+                    local_rows.emplace_back(std::move(record));
+                    stats.parsed_triples.fetch_add(1, std::memory_order_relaxed);
+                    stats.field_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (!nlptr) break;
+            pos = (static_cast<const char*>(nlptr) - base) + 1;
+            ++line_no;
+        }
+    }
+
+    void write_summary(const Stats& stats, size_t file_count, uint64_t unique_total) {
+        if (args_.no_summary || args_.summary.empty()) return;
+        std::ofstream s(args_.summary, std::ios::binary | std::ios::trunc);
+        if (!s) return;
+        double elapsed = elapsed_seconds();
+        s << "{\n"
+          << "  \"version\": \"" << APP_VERSION << "\",\n"
+          << "  \"generated_at\": \"" << now_iso() << "\",\n"
+          << "  \"mode\": \"abc-directory-dedupe\",\n"
+          << "  \"output\": \"" << json_escape(args_.output) << "\",\n"
+          << "  \"format\": \"" << args_.format << "\",\n"
+          << "  \"parse_mode\": \"" << args_.parse_mode << "\",\n"
+          << "  \"threads\": " << args_.threads << ",\n"
+          << "  \"files_matched_filters\": " << file_count << ",\n"
+          << "  \"files_scanned\": " << stats.files_scanned.load() << ",\n"
+          << "  \"bytes_scanned\": " << stats.bytes_scanned.load() << ",\n"
+          << "  \"lines_read\": " << stats.candidate_lines.load() << ",\n"
+          << "  \"parsed_triples_before_dedupe\": " << stats.parsed_triples.load() << ",\n"
+          << "  \"unique_triples\": " << unique_total << ",\n"
+          << "  \"written_results\": " << stats.written.load() << ",\n"
+          << "  \"duplicates_removed\": " << stats.duplicates.load() << ",\n"
+          << "  \"elapsed_seconds\": " << std::fixed << std::setprecision(3) << elapsed << "\n"
+          << "}\n";
+    }
+
+    Args args_;
+    std::vector<DedupeRecord> rows_;
+    std::mutex rows_mutex_;
+    std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+};
+
+static int run_dedupe_only(Args args) {
+    const bool quiet = args.quiet;
+    const std::string output = args.output;
+    Stats stats;
+    std::string err;
+    DirectoryDeduper deduper(std::move(args));
+    bool ok = deduper.run(stats, &err);
+    double elapsed = deduper.elapsed_seconds();
+    if (!ok) {
+        std::cerr << "错误 / Error: " << err << "\n";
+        return 1;
+    }
+    if (!quiet) {
+        std::cout << "独立去重完成: parsed=" << stats.parsed_triples.load()
+                  << " written=" << stats.written.load()
+                  << " dup=" << stats.duplicates.load()
+                  << " elapsed=" << std::fixed << std::setprecision(3) << elapsed << "s\n"
+                  << "output=" << output << "\n";
+    }
+    return 0;
+}
+
 
 [[maybe_unused]] static void print_stats(const Args& args, const Stats& stats, double elapsed) {
     if (args.quiet) return;
@@ -829,14 +1306,22 @@ private:
 }
 
 static void print_help() {
-    std::cout << R"HELP(rgs-native v5.0.1-console-fix
+    std::cout << R"HELP(rgs-native v5.2.1-interactive-dedupe
 
 用法 / Usage:
   rgs                 # 先选择 CLI 交互式或浏览器 GUI
   rgs --menu          # 显示启动菜单
-  rgs --cli           # 直接进入 CLI 交互式
+  rgs --cli           # 直接进入检索交互式
+  rgs --dedupe        # 直接进入独立去重交互式
   rgs --gui           # 打开本地浏览器 GUI
   rgs scan -p DATA -k KEY --field B -o result.csv --glob "*.txt"
+  rgs dedupe -p DATA -o deduped.txt --format txt --glob "*.txt"
+
+独立目录去重 / Standalone directory de-duplication:
+  rgs dedupe                       # 进入去重交互式向导
+  rgs --dedupe                     # 同上
+  rgs dedupe -p ./data -o deduped.txt --format txt --parse urlpath --glob "*.txt"
+  rgs --dedupe-only -p ./data -o deduped.csv --format csv
 
 极速固定字符串检索 / Fast fixed-string examples:
   rgs scan -p ./data -k alice --field B -o result.csv --format csv --glob "*.txt"
@@ -863,10 +1348,12 @@ static void print_help() {
       --threads N             线程数，默认 CPU 核数
       --summary FILE          写 summary JSON
       --quiet                 静默输出
+      --dedupe-only           独立目录去重模式，不进入 CLI/GUI，不需要关键词
       --self-test             运行内置测试
 
 说明:
-  本工具只处理本机授权文件。核心路径是：内存映射文件 -> 按行候选过滤 -> A/B/C 解析 -> 字段匹配 -> 内存 set 去重 -> 流式写出。
+  scan 模式：内存映射文件 -> 按行候选过滤 -> A/B/C 解析 -> 字段匹配 -> 分片内存 set 严格去重 -> 流式写出。
+  dedupe 模式：读取目录全部文件 -> 解析全部 A/B/C -> 按 A -> B -> C 排序 -> 去重 -> 写出。
 )HELP";
 }
 
@@ -914,6 +1401,41 @@ static bool parse_scan_args(int argc, char** argv, int start, Args& args, std::s
     return true;
 }
 
+static bool parse_dedupe_args(int argc, char** argv, int start, Args& args, std::string* err) {
+    args.dedupe_only = true;
+    args.scan = false;
+    args.keywords.clear();
+    args.keyword_files.clear();
+    args.output = "rg_abc_deduped.txt";
+    args.format = "txt";
+    args.columns = "abc";
+    args.parse_mode = "urlpath";
+    args.no_summary = true;
+    for (int i = start; i < argc; ++i) {
+        std::string a = argv[i];
+        auto need = [&](const char* name) -> std::string {
+            if (!arg_has_value(i, argc)) { if (err) *err = std::string("Missing value for ") + name; return {}; }
+            return argv[++i];
+        };
+        if (a == "-p" || a == "--path") args.paths.push_back(need(a.c_str()));
+        else if (a == "-o" || a == "--output") args.output = need(a.c_str());
+        else if (a == "--format") args.format = need(a.c_str());
+        else if (a == "--columns" || a == "--abc-columns") args.columns = need(a.c_str());
+        else if (a == "--parse" || a == "--abc-parse") args.parse_mode = need(a.c_str());
+        else if (a == "--glob") args.include_globs.push_back(need(a.c_str()));
+        else if (a == "--exclude") args.exclude_globs.push_back(need(a.c_str()));
+        else if (a == "--max-filesize") args.max_filesize = parse_size(need(a.c_str()));
+        else if (a == "--limit") args.limit = static_cast<size_t>(std::stoull(need(a.c_str())));
+        else if (a == "--threads") args.threads = static_cast<unsigned>(std::stoul(need(a.c_str())));
+        else if (a == "--summary") { args.summary = need(a.c_str()); args.no_summary = false; }
+        else if (a == "--no-summary") { args.summary.clear(); args.no_summary = true; }
+        else if (a == "--quiet") args.quiet = true;
+        else if (a == "--help" || a == "-h") { args.help = true; return true; }
+        else { if (err) *err = "Unknown dedupe option: " + a; return false; }
+    }
+    return true;
+}
+
 static Args parse_args(int argc, char** argv, std::string* err) {
     Args args;
     if (argc <= 1) return args;
@@ -923,6 +1445,22 @@ static Args parse_args(int argc, char** argv, std::string* err) {
     if (first == "--menu" || first == "menu") { return args; }
     if (first == "--cli" || first == "interactive" || first == "cli") { args.interactive = true; return args; }
     if (first == "--gui" || first == "gui") { args.gui = true; return args; }
+    if (first == "--dedupe" || first == "--dedupe-cli" || first == "dedupe-cli") {
+        args.dedupe_interactive = true;
+        return args;
+    }
+    if (first == "dedupe" || first == "dedup" || first == "unique") {
+        // `rgs dedupe` opens the standalone de-dupe wizard.
+        // `rgs dedupe -p ...` stays script-friendly and runs non-interactively.
+        if (argc <= 2) { args.dedupe_interactive = true; return args; }
+        parse_dedupe_args(argc, argv, 2, args, err);
+        return args;
+    }
+    if (first == "--dedupe-only") {
+        if (argc <= 2) { args.dedupe_interactive = true; return args; }
+        parse_dedupe_args(argc, argv, 2, args, err);
+        return args;
+    }
     if (first == "scan") {
         parse_scan_args(argc, argv, 2, args, err);
         return args;
@@ -1013,6 +1551,56 @@ static int run_interactive_cli() {
     try { args.limit = static_cast<size_t>(std::stoull(limit)); } catch (...) { args.limit = 0; }
     args.no_summary = true;
     return run_scan(args);
+}
+
+static int run_interactive_dedupe() {
+    std::cout << "\n=== rgs-native 独立交互式去重 ===\n" << std::flush;
+    std::cout << "说明：该模式不需要关键词，不走检索 CLI，也不走 GUI。\n"
+              << "会读取目录下所有匹配文件，全部读取后按 A -> B -> C 排序去重。\n" << std::flush;
+
+    Args args;
+    args.dedupe_only = true;
+    args.scan = false;
+    args.keywords.clear();
+    args.keyword_files.clear();
+    args.output = "rg_abc_deduped.txt";
+    args.format = "txt";
+    args.columns = "abc";
+    args.parse_mode = "urlpath";
+    args.no_summary = true;
+
+    std::string path_line = prompt_line("去重路径，多个文件或目录用 ; 分隔");
+    args.paths = split_list(path_line, ';');
+
+    args.output = prompt_line("输出文件", args.output);
+    args.format = lower_ascii(prompt_line("输出格式 csv/txt/jsonl", args.format));
+    args.columns = lower_ascii(prompt_line("输出列 abc/full，abc 最快", args.columns));
+    args.parse_mode = lower_ascii(prompt_line("解析模式 urlpath/url/simple", args.parse_mode));
+
+    std::string glob_line = prompt_line("include glob，多个用 ; 分隔，空=全部", "*.txt");
+    if (!glob_line.empty()) args.include_globs = split_list(glob_line, ';');
+
+    std::string exclude_line = prompt_line("exclude glob/目录片段，多个用 ; 分隔，空=不排除", "");
+    if (!exclude_line.empty()) args.exclude_globs = split_list(exclude_line, ';');
+
+    std::string max_size = prompt_line("跳过大文件 max-filesize，例如 200M/1G，空=不限", "");
+    if (!max_size.empty()) args.max_filesize = parse_size(max_size);
+
+    std::string threads = prompt_line("线程数，0=CPU 核数", "0");
+    try { args.threads = static_cast<unsigned>(std::stoul(threads)); } catch (...) { args.threads = 0; }
+
+    std::string limit = prompt_line("最多写出条数，0=不限；注意仍会先读取并完成去重", "0");
+    try { args.limit = static_cast<size_t>(std::stoull(limit)); } catch (...) { args.limit = 0; }
+
+    if (prompt_bool("是否写 summary JSON", false)) {
+        args.no_summary = false;
+        args.summary = prompt_line("summary 输出文件", args.output + ".summary.json");
+    }
+
+    args.quiet = prompt_bool("是否静默输出", false);
+
+    std::cout << "\n开始独立去重...\n" << std::flush;
+    return run_dedupe_only(args);
 }
 
 static std::string url_decode(std::string_view in) {
@@ -1277,16 +1865,18 @@ static int run_start_menu() {
     while (true) {
         std::cout << "\n=== rgs-native v" << APP_VERSION << " ===\n"
                   << "1) CLI 交互式极速检索\n"
-                  << "2) GUI 浏览器界面\n"
+                  << "2) 独立交互式去重\n"
+                  << "3) GUI 浏览器界面\n"
                   << "q) 退出\n"
                   << "请选择 [1]: " << std::flush;
         std::string s;
         if (!std::getline(std::cin, s)) return 0;
         s = trim_copy(lower_ascii(s));
         if (s.empty() || s == "1" || s == "cli" || s == "c") return run_interactive_cli();
-        if (s == "2" || s == "gui" || s == "g") return run_gui_server();
+        if (s == "2" || s == "dedupe" || s == "dedup" || s == "unique" || s == "d") return run_interactive_dedupe();
+        if (s == "3" || s == "gui" || s == "g") return run_gui_server();
         if (s == "q" || s == "quit" || s == "exit") return 0;
-        std::cout << "无效输入，请输入 1、2 或 q。\n" << std::flush;
+        std::cout << "无效输入，请输入 1、2、3 或 q。\n" << std::flush;
     }
 }
 
@@ -1340,6 +1930,104 @@ static int self_test() {
         std::cerr << "output content failed\n";
         return 1;
     }
+
+    // Strict de-dupe regression: fields may contain the old separator/control byte.
+    // The key must remain exact and collision-free.
+    fs::path tricky = tmp / "tricky.txt";
+    {
+        std::ofstream f(tricky, std::ios::binary);
+        f << "plain" << char(0x1f) << "A:needle:one\n";
+        f << "plain" << char(0x1f) << "A:needle:one\n";
+        f << "plain:needle" << char(0x1f) << "A:one\n";
+    }
+    Args b;
+    b.paths.push_back(tricky.string());
+    b.keywords.push_back("needle");
+    b.field = "B";
+    b.output = (tmp / "tricky.csv").string();
+    b.format = "csv";
+    b.columns = "abc";
+    b.parse_mode = "simple";
+    b.quiet = true;
+    b.no_summary = true;
+    Stats st2;
+    Scanner sc2(b);
+    if (!sc2.run(st2, &err) || st2.written.load() != 2 || st2.duplicates.load() != 1) {
+        std::cerr << "strict dedupe failed: " << err << " written=" << st2.written.load()
+                  << " dup=" << st2.duplicates.load() << "\n";
+        return 1;
+    }
+
+    // Regression: output inside input directory must be skipped. Otherwise old
+    // output lines can feed back into a new scan and create duplicates.
+    fs::path sample2 = tmp / "sample2.txt";
+    fs::path out2 = tmp / "results.txt";
+    {
+        std::ofstream f(sample2, std::ios::binary);
+        f << "https://gamma.test/login:Alice:fresh\n";
+    }
+    {
+        std::ofstream f(out2, std::ios::binary);
+        for (int i = 0; i < 50; ++i) f << "https://gamma.test/login:Alice:old-output\n";
+    }
+    Args c;
+    c.paths.push_back(tmp.string());
+    c.keywords.push_back("Alice");
+    c.field = "B";
+    c.output = out2.string();
+    c.format = "txt";
+    c.columns = "abc";
+    c.parse_mode = "urlpath";
+    c.quiet = true;
+    c.no_summary = true;
+    Stats st3;
+    std::string err3;
+    Scanner sc3(c);
+    if (!sc3.run(st3, &err3) || st3.written.load() != 2 || st3.duplicates.load() != 1) {
+        std::cerr << "output self-scan skip failed: " << err3 << " written=" << st3.written.load()
+                  << " dup=" << st3.duplicates.load() << "\n";
+        return 1;
+    }
+
+    // Standalone directory de-duplication: read all files first, then sort by
+    // A -> B -> C and remove exact A/B/C duplicates.
+    fs::path d1 = tmp / "dedupe_1.txt";
+    fs::path d2 = tmp / "dedupe_2.txt";
+    {
+        std::ofstream f1(d1, std::ios::binary);
+        f1 << "https://z.test/:bob:3\n";
+        f1 << "https://a.test/:alice:1\n";
+        f1 << "https://a.test/:alice:1\n";
+        std::ofstream f2(d2, std::ios::binary);
+        f2 << "https://a.test/:alice:2\n";
+        f2 << "https://a.test/:alice:1\n";
+    }
+    Args da;
+    da.dedupe_only = true;
+    da.paths.push_back(tmp.string());
+    da.output = (tmp / "deduped.txt").string();
+    da.format = "txt";
+    da.columns = "abc";
+    da.parse_mode = "urlpath";
+    da.quiet = true;
+    da.no_summary = true;
+    da.include_globs.push_back("dedupe_*.txt");
+    Stats dst;
+    std::string derr;
+    DirectoryDeduper dd(da);
+    if (!dd.run(dst, &derr) || dst.written.load() != 3 || dst.duplicates.load() != 2) {
+        std::cerr << "standalone dedupe failed: " << derr << " written=" << dst.written.load()
+                  << " dup=" << dst.duplicates.load() << "\n";
+        return 1;
+    }
+    std::ifstream din(da.output, std::ios::binary);
+    std::string dcontent((std::istreambuf_iterator<char>(din)), {});
+    std::string expected_order = "https://a.test/:alice:1\nhttps://a.test/:alice:2\nhttps://z.test/:bob:3\n";
+    if (dcontent != expected_order) {
+        std::cerr << "standalone dedupe order/content failed\n" << dcontent;
+        return 1;
+    }
+
     std::error_code ec;
     fs::remove_all(tmp, ec);
     std::cout << "self-test ok\n";
@@ -1361,7 +2049,9 @@ int main(int argc, char** argv) {
     if (args.help) { print_help(); return 0; }
     if (args.self_test) return self_test();
     if (args.interactive) return run_interactive_cli();
+    if (args.dedupe_interactive) return run_interactive_dedupe();
     if (args.gui) return run_gui_server();
+    if (args.dedupe_only) return run_dedupe_only(args);
     if (args.scan) return run_scan(args);
     return run_start_menu();
 }

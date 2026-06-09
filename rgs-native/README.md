@@ -372,6 +372,66 @@ https://example.com/login:user:pass
 {"A":"https://example.com/login","B":"user","C":"pass"}
 ```
 
+# rgs-native 独立交互式去重版
+
+新增独立 A/B/C 去重入口：不需要关键词，不进入普通 CLI 检索流程，也不启动 GUI。
+
+## 启动方式
+
+默认菜单：
+
+```bash
+./rgs
+```
+
+菜单中选择：
+
+```text
+3) 独立 A/B/C 去重
+```
+
+直接进入独立交互式去重：
+
+```bash
+./rgs --dedupe
+./rgs dedupe
+```
+
+非交互直参模式仍然保留：
+
+```bash
+./rgs dedupe -p ./data -o deduped.txt --format txt --parse urlpath --glob "*.txt"
+```
+
+## 去重规则
+
+独立去重模式会：
+
+1. 读取目录下所有匹配文件。
+2. 解析所有可解析的 A:B:C 行。
+3. 全部读入内存。
+4. 按 A -> B -> C 排序。
+5. A 相同就比较 B，B 相同再比较 C。
+6. 只有 A/B/C 三个字段完全一致才删除重复。
+7. 输出最终结果。
+
+## 编译
+
+Linux：
+
+```bash
+g++ -std=c++20 -O3 -DNDEBUG -pthread rgs-native/src/rgs.cpp -o rgs
+./rgs --self-test
+```
+
+Windows 交叉编译：
+
+```bash
+x86_64-w64-mingw32-g++ -std=c++20 -O3 -DNDEBUG \
+  -static -static-libgcc -static-libstdc++ \
+  rgs-native/src/rgs.cpp -o rgs-windows-x64.exe -lws2_32
+```
+
 ---
 
 ## 注意事项
